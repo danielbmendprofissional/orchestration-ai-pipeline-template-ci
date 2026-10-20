@@ -1,0 +1,59 @@
+# ============================================================
+# =                TEMPLATE BUILD - ANGULAR
+# ============================================================
+# Gera o bundle uma vez só. A configuração por ambiente NÃO entra no build:
+# vem em runtime pelo nginx (/config.json), então a mesma imagem serve qa/hml/prod.
+#
+# Variáveis:
+#   ANGULAR_DIST_PATH  (obrigatória) saída do build, relativa ao workdir (ex: dist/meu-app/browser)
+#   ANGULAR_WORKDIR    (opcional)    subpasta do projeto Angular no repositório
+#   ANGULAR_APP_NAME   (default web) nome da app/imagem/deployment
+#   BUILD_COMMAND      (default build) script do package.json
+#   NODE_IMAGE         (default)     node:24-alpine
+.build-angular:
+  stage: build
+  image: ${NODE_IMAGE}
+  tags:
+    - $RUNNER_TAG
+  timeout: 30 minutes
+  interruptible: true
+  variables:
+    NODE_IMAGE: node:24-alpine
+    ANGULAR_APP_NAME: web
+    BUILD_COMMAND: build
+    NPM_CONFIG_CACHE: $CI_PROJECT_DIR/.npm
+  cache:
+    key: npm-cache
+    paths:
+      - .npm/
+  script:
+    - |
+      set -eu
+
+      PROJECT_DIR="$CI_PROJECT_DIR${ANGULAR_WORKDIR:+/$ANGULAR_WORKDIR}"
+      echo "[INFO] PROJECT_DIR       : $PROJECT_DIR"
+      echo "[INFO] ANGULAR_DIST_PATH : $ANGULAR_DIST_PATH"
+      cd "$PROJECT_DIR"
+
+      if [ ! -f package-lock.json ]; then
+        echo "[ERRO] package-lock.json ausente em $PROJECT_DIR — o build precisa ser reprodutível (rode 'npm install' e comite o lock)"
+        exit 1
+      fi
+
+      npm ci --prefer-offline --no-audit --no-fund
+      npm run "$BUILD_COMMAND"
+
+      if [ ! -f "$ANGULAR_DIST_PATH/index.html" ]; then
+        echo "[ERRO] $ANGULAR_DIST_PATH/index.html não encontrado — confira ANGULAR_DIST_PATH"
+        exit 1
+      fi
+
+      rm -rf "$CI_PROJECT_DIR/publish"
+      mkdir -p "$CI_PROJECT_DIR/publish"
+      cp -r "$ANGULAR_DIST_PATH" "$CI_PROJECT_DIR/publish/$ANGULAR_APP_NAME"
+      echo "[INFO] Bundle copiado para publish/$ANGULAR_APP_NAME"
+  artifacts:
+    name: "build-angular-$PIPELINE_TAG"
+    expire_in: 7 days
+    paths:
+      - publish/

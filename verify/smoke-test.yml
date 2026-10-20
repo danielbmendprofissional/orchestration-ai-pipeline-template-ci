@@ -1,0 +1,58 @@
+# ============================================================
+# =                  TEMPLATE SMOKE TEST
+# ============================================================
+# Healthcheck HTTP com retry depois do deploy. Não desfaz o deploy: deixa a
+# pipeline vermelha, visível antes da próxima promoção.
+#
+#   APP_URL           escopo de ambiente (mesma do deploy) — checa APP_URL + HEALTH_PATH
+#   HEALTH_PATH       default /healthz (nginx do Angular); API .NET: /health
+#   SMOKE_EXTRA_URLS  escopo de ambiente, opcional — URLs completas a mais, separadas por
+#                     espaço. Monorepo: a API num host próprio, ex: https://api.qa.x.dev/health
+#   Sem APP_URL e sem SMOKE_EXTRA_URLS = smoke pulado.
+.smoke-test:
+  stage: verify
+  image: alpine:3.22
+  tags:
+    - $RUNNER_TAG
+  timeout: 10 minutes
+  variables:
+    GIT_STRATEGY: none
+    HEALTH_PATH: /healthz
+    SMOKE_ATTEMPTS: "10"
+  script:
+    - |
+      set -eu
+      URLS="${SMOKE_EXTRA_URLS:-}"
+      if [ -n "${APP_URL:-}" ]; then
+        URLS="${APP_URL%/}$HEALTH_PATH $URLS"
+      fi
+      if [ -z "$(echo "$URLS" | tr -d ' ')" ]; then
+        echo "[INFO] APP_URL/SMOKE_EXTRA_URLS não definidas para o ambiente '$PIPELINE_ENV' — smoke test pulado"
+        exit 0
+      fi
+
+      apk add --no-cache curl >/dev/null
+      FAILED=""
+
+      for URL in $URLS; do
+        echo "[INFO] Smoke test: $URL"
+        OK=false
+        i=1
+        while [ "$i" -le "$SMOKE_ATTEMPTS" ]; do
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$URL" || echo "000")
+          echo "[INFO]   tentativa $i/$SMOKE_ATTEMPTS: HTTP $STATUS"
+          if [ "$STATUS" -ge 200 ] && [ "$STATUS" -lt 300 ]; then
+            OK=true
+            break
+          fi
+          sleep 6
+          i=$((i + 1))
+        done
+        [ "$OK" = "true" ] || FAILED="$FAILED $URL"
+      done
+
+      if [ -n "$FAILED" ]; then
+        echo "[ERRO] Não responderam 2xx após $SMOKE_ATTEMPTS tentativas:$FAILED"
+        exit 1
+      fi
+      echo "[INFO] Smoke test OK"

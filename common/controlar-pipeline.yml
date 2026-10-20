@@ -1,0 +1,1157 @@
+# ============================================================
+# =              BASE CONTROLAR-PIPELINE (CONTROLE)
+# ============================================================
+.controlar-pipeline:
+  stage: controle
+  image: alpine:3.22
+  tags:
+    - $RUNNER_TAG
+  script:
+    - |
+      set -eu
+      (set -o pipefail 2>/dev/null) && set -o pipefail || true
+      for i in 1 2 3; do
+        apk add --no-cache git && break
+        if [ "$i" = "3" ]; then
+          echo "[ERRO] Falha ao instalar o git (apk) após 3 tentativas — verifique o acesso do runner ao repositório de pacotes. Pipeline bloqueado."
+          exit 1
+        fi
+        echo "[AVISO] apk add falhou (tentativa $i/3) — repetindo..."
+        sleep 5
+      done
+      rm -f context.env || true
+      git config --global versionsort.suffix -rc
+      echo "[INFO] Iniciando controle de fluxo"
+
+      # ============================================================
+      # = FUNÇÕES AUXILIARES
+      # ============================================================
+
+      #-----------------------
+      # Envia variavel para o context.env
+      #-----------------------
+      DefineVariavel() {
+        local key="$1"
+        local value="$2"
+
+        echo "${key}=$(printf "%s" "$value")" >> context.env
+      }
+
+      # DefineAmbienteBase e DefineKinds (BUILD_KIND/DEPLOY_KIND) agora moram
+      # no job .definir-kind, mais abaixo neste mesmo arquivo — veja o
+      # comentário perto de "Iniciando controle de fluxo" acima.
+
+      #-----------------------
+      # Descobre a tag promovida em cenários fora de ci_commit_tag
+      #-----------------------
+      FindPromotedTag() {
+        local before_sha="$1"
+        local candidate commit tag_try try_sha extra candidates candidate_count top top_sha other other_sha all_ancestors
+
+        rm -f .before_tags.tmp
+
+        #-----------------------
+        # Descobre se existe um sha anterior para verificar as tags novas comparadas a ele
+        #-----------------------
+        if [ -n "$before_sha" ] && [ "$before_sha" != "0000000000000000000000000000000000000000" ] \
+          && [ "$before_sha" != "${CI_COMMIT_SHA:-}" ] \
+          && git cat-file -e "$before_sha" 2>/dev/null; then
+          echo "[INFO] FindPromotedTag: usando modo 'before_sha' ($before_sha)" >&2
+          git tag --merged "$before_sha" > .before_tags.tmp 2>/dev/null || true
+
+          if [ -s .before_tags.tmp ]; then
+            candidates=$(git tag --merged HEAD --sort=-v:refname 2>/dev/null | grep -vFxf .before_tags.tmp || true)
+          else
+            candidates=$(git tag --merged HEAD --sort=-v:refname 2>/dev/null || true)
+          fi
+        #-----------------------
+        # Sem sha ele vai pegar todas as tags, passar pelo sha de cada uma e definir as possíveis
+        # candidatas ou não.
+        #-----------------------
+        else
+          echo "[INFO] FindPromotedTag: usando modo fallback (before_sha='${before_sha:-<vazio>}', CI_COMMIT_SHA='${CI_COMMIT_SHA:-<vazio>}') — escaneando tags limpas na ponta de HEAD" >&2
+          candidates=""
+          for tag_try in $(git tag --merged HEAD --sort=-v:refname 2>/dev/null); do
+            try_sha=$(git rev-list -n1 "$tag_try" 2>/dev/null || true)
+            extra=$(git rev-list --no-merges "${try_sha}..HEAD" 2>/dev/null || true)
+            if [ -z "$extra" ]; then
+              candidates=$(printf "%s\n%s" "$candidates" "$tag_try")
+            fi
+          done
+          candidates=$(echo "$candidates" | grep -v '^$' || true)
+        fi
+
+        echo "[INFO] FindPromotedTag: candidatas encontradas: ${candidates:-<nenhuma>}" >&2
+        rm -f .before_tags.tmp
+
+        #-----------------------
+        # Se existir +1 possível candidata, descobre qual é a mais nova DE VERDADE testando
+        # ancestralidade direto (quem tem todas as outras como ancestral). Só fica AMBIGUOUS
+        # quando nenhuma candidata tem todas as outras como ancestral (não existe uma "mais nova" clara entre elas).
+        #-----------------------
+        candidate_count=$(echo "$candidates" | grep -c . || true)
+        if [ "$candidate_count" -gt 1 ]; then
+          candidate=""
+          for top in $(echo "$candidates"); do
+            top_sha=$(git rev-list -n1 "$top" 2>/dev/null || true)
+            all_ancestors=true
+            for other in $(echo "$candidates"); do
+              [ "$other" = "$top" ] && continue
+              other_sha=$(git rev-list -n1 "$other" 2>/dev/null || true)
+              if ! git merge-base --is-ancestor "$other_sha" "$top_sha" 2>/dev/null; then
+                all_ancestors=false
+                break
+              fi
+            done
+            if [ "$all_ancestors" = "true" ]; then
+              candidate="$top"
+              break
+            fi
+          done
+          if [ -z "$candidate" ]; then
+            echo "AMBIGUOUS $(echo "$candidates" | tr '\n' ' ')"
+            return 0
+          fi
+        else
+          candidate=$(echo "$candidates" | head -n1)
+        fi
+
+        [ -z "$candidate" ] && return 0
+
+        commit=$(git rev-list -n1 "$candidate" 2>/dev/null || true)
+        echo "$candidate $commit"
+        return 0
+      }
+
+      #-----------------------
+      # Descobre de onde veio uma TAG, em qual branch ele está na ponta dela, 1 ou N
+      #-----------------------
+      FindOriginBranch() {
+        local sha="$1"
+        local entry label branch extra matches
+        shift
+
+        matches=""
+        for entry in "$@"; do
+          label="${entry%%:*}"
+          branch="${entry#*:}"
+          if [ -n "$branch" ] && git merge-base --is-ancestor "$sha" "origin/$branch" 2>/dev/null; then
+            extra=$(git rev-list --no-merges "${sha}..origin/${branch}" 2>/dev/null || true)
+            if [ -z "$extra" ]; then
+              matches="$matches $label"
+            fi
+          fi
+        done
+
+        matches="${matches# }"
+        [ -z "$matches" ] && return 1
+        echo "$matches"
+        return 0
+      }
+
+      #-----------------------
+      # Verifica se uma tag candidata (rcN) é valida.
+      #-----------------------
+      ValidateCandidateTag() {
+        local tag="$1"
+        local sha="$2"
+        local mode="${3:-cut}"
+        local core rest major minor patch rc rc_num
+        local prev_rc prev_rc_sha
+        local chain_prev chain_cur chain_i chain_prev_sha chain_cur_sha
+        local highest_major expected_major first_stage first_stage_tier first_stage_tier_list
+        local cand_check_stage cand_matched
+        local cand_tag cand_core cand_major cand_sha cand_check_branch
+        local align_stage align_branch ahead_tag ahead_core ahead_major
+        local first_stage_branch latest_published latest_published_sha novo_conteudo
+        local prev_tag prev_core prev_rest prev_minor prev_patch
+        local other_open_majors prior_furthest new_idx old_idx cross_major_hit
+
+        core="${tag%%-rc*}"
+        rest="${core#v}"
+        major="${rest%%.*}"
+        rest="${rest#*.}"
+        minor="${rest%%.*}"
+        patch="${rest#*.}"
+        rc="${tag##*-rc}"
+
+        if [ "$minor" != "0" ]; then
+          echo "[ERRO] TAG '$tag' é candidata mas o minor não é 0 (recebido: $minor). Durante dev/qa/hml o minor fica sempre em 0 — ele só muda depois de publicado, em produção. Pipeline bloqueado."
+          return 1
+        fi
+
+        if [ "$patch" != "0" ]; then
+          echo "[ERRO] TAG '$tag' é candidata mas o patch não é 0 (recebido: $patch). Patch é hotfix, só existe em produção — durante dev/qa/hml fica sempre em 0. Pipeline bloqueado."
+          return 1
+        fi
+
+        #-----------------------
+        # Usa o findOriginBranch para descobrir onde a tag está no topo limpa agora
+        #-----------------------
+        CANDIDATE_ORIGIN_MATCHES=$(FindOriginBranch "$sha" "dev:$DEV_REAL_BRANCH" "qa:$QA_REAL_BRANCH" "hml:$HOMOLOG_REAL_BRANCH" || true)
+        CANDIDATE_ORIGIN="${CANDIDATE_ORIGIN_MATCHES%% *}"
+        CANDIDATE_ORIGIN_AMBIGUOUS=""
+        set -- $CANDIDATE_ORIGIN_MATCHES
+        if [ "$#" -gt 1 ]; then
+          CANDIDATE_ORIGIN_AMBIGUOUS="$CANDIDATE_ORIGIN_MATCHES"
+        fi
+
+        #-----------------------
+        # Quando não encontrou onde a tag nasceu ele tenta busca-la por ancestralidade, exemplo:
+        # Tag não está em nenhuma ponta, mas está na ancestralidade de alguém ai avisa para corrigir
+        # Se estiver tudo errado ai manda erro mesmo
+        #-----------------------
+        if [ -z "$CANDIDATE_ORIGIN" ]; then
+          local any_ancestor="" chk_branch
+          for chk_branch in "$DEV_REAL_BRANCH" "$QA_REAL_BRANCH" "$HOMOLOG_REAL_BRANCH"; do
+            if [ -n "$chk_branch" ] && git merge-base --is-ancestor "$sha" "origin/$chk_branch" 2>/dev/null; then
+              any_ancestor="$chk_branch"
+              break
+            fi
+          done
+
+          if [ -n "$any_ancestor" ]; then
+            echo "[ERRO] TAG '$tag' é ancestral de pelo menos um dos branches (ex: '$any_ancestor'), mas nenhum deles tem ela limpa na ponta — todos têm commit(s) de conteúdo real além dela. Provável causa: merge cruzado entre branches (ex: resolver um conflito trazendo de volta um commit que já tinha ido pro outro lado) em vez de promover a tag isoladamente. Não dá pra determinar uma origem limpa. Pipeline bloqueado."
+            echo "[ERRO] Sem alterar código, crie uma nova tag a partir dessa branch no formato '${core}-rc$((10#$rc + 1))' (a próxima candidata em sequência) — como a origem da tag antiga não pode mais ser determinada, uma tag nova sobre o mesmo conteúdo já reconciliado resolve."
+          else
+            echo "[ERRO] TAG '$tag' não pertence a nenhum dos branches dev/qa/hml. Pipeline bloqueado."
+          fi
+          return 1
+        fi
+        if [ -n "$CANDIDATE_ORIGIN_AMBIGUOUS" ]; then
+          echo "[INFO] TAG validada — origem: $CANDIDATE_ORIGIN (ambígua — também bate limpo com: ${CANDIDATE_ORIGIN_AMBIGUOUS#* })"
+        else
+          echo "[INFO] TAG validada — origem: $CANDIDATE_ORIGIN"
+        fi
+
+        #-----------------------
+        # Ele vai pegar a tag anterior a essa que estou publicando pelo core ordenado
+        # Estou subindo a v2.0.0-rc3, ai ele vai pegar a v2.0.0-rc2 se for a última antes dessa
+        # Ai ele vai validar se está correto pela ordem, numeração, etc.
+        #-----------------------
+        prev_rc=$(git tag --list "${core}-rc*" --sort=-v:refname | grep -vFx "$tag" | head -n1 || true)
+        rc_num=$((10#$rc))
+
+        #-----------------------
+        # Se o rcN da tag atual que está tentando publicar é rc1+, significa que é uma evolução
+        # de algum core ja existente (v1.0.0-rc1, v1.0.0-rc2, etc...)
+        #-----------------------
+        if [ "$rc_num" -gt 1 ]; then
+          if [ -z "$prev_rc" ]; then
+            echo "[ERRO] TAG '$tag' pressupõe a sequência de candidatas de '$core', mas nenhuma candidata anterior existe no repositório — a sequência quebra aí. Pipeline bloqueado."
+            return 1
+          fi
+
+          #-----------------------
+          # Mesmo que tenha uma rc prévia, ainda precisa de existir uma core inicial nesse repo
+          # ex: v1.0.0-rc1 precisa estar se eu estou subindo uma v1.0.0-rc8
+          #-----------------------
+          chain_prev="${core}-rc1"
+          if ! git rev-parse "$chain_prev" >/dev/null 2>&1; then
+            echo "[ERRO] TAG '$tag' pressupõe a sequência de candidatas de '$core', mas '$chain_prev' não existe no repositório — a sequência quebra aí. Pipeline bloqueado."
+            return 1
+          fi
+
+          #-----------------------
+          # Aqui ja validado que existe a rc1, ele vai validar até o rcN que estou subindo, se
+          # os outros rcN existem e se estão na ordem correta, ex: v1.0.0-rc8, precisa ter do
+          # rc2 até o rc7 na ordem correta e sem falhas
+          #-----------------------
+          for chain_i in $(seq 2 $((rc_num - 1)) 2>/dev/null || true); do
+            chain_cur="${core}-rc${chain_i}"
+            if ! git rev-parse "$chain_cur" >/dev/null 2>&1; then
+              echo "[ERRO] TAG '$tag' pressupõe a sequência de candidatas de '$core', mas '$chain_cur' não existe — a sequência quebra aí (provável tag rejeitada em algum ponto anterior, nunca corrigida nem apagada). Pipeline bloqueado."
+              return 1
+            fi
+            chain_prev_sha=$(git rev-parse "$chain_prev")
+            chain_cur_sha=$(git rev-parse "$chain_cur")
+            if ! git merge-base --is-ancestor "$chain_prev_sha" "$chain_cur_sha" 2>/dev/null; then
+              echo "[ERRO] TAG '$tag' pressupõe a sequência de candidatas de '$core', mas '$chain_cur' não descende de '$chain_prev' — a sequência quebra aí. Pipeline bloqueado."
+              return 1
+            fi
+            chain_prev="$chain_cur"
+          done
+
+          prev_rc="$chain_prev"
+
+          #-----------------------
+          # Aqui ele verifica a coerencia entre a atual e prev, na teoria o atual precisa ser
+          # sha descendente do prev.
+          #-----------------------
+          prev_rc_sha=$(git rev-parse "$prev_rc")
+          if ! git merge-base --is-ancestor "$prev_rc_sha" "$sha" 2>/dev/null; then
+            echo "[ERRO] TAG '$tag' não descende de '$prev_rc' — candidata desconectada do histórico dessa release. Pipeline bloqueado."
+            return 1
+          fi
+
+          echo "[INFO] Sequência OK: '$tag' descende de toda a cadeia validada de '$core' até '$prev_rc' e é a próxima rc (rc$rc_num)"
+
+          #-----------------------
+          # 1 MAJOR aberto, correção pode voltar pra qualquer
+          # estágio à vontade (como sempre foi). Mas se existe OUTRO MAJOR aberto ao mesmo
+          # tempo, ninguém mais "volta" — corrigir só é permitido no estágio atual do MAJOR
+          # pra frente.
+          #
+          # Só verifica isso no momento em que a tag é CORTADA (push direto da tag,
+          # mode="cut") — nunca durante a revalidação de uma PROMOÇÃO (mode="promotion").
+          #-----------------------
+          if [ "$mode" = "cut" ]; then
+            other_open_majors=$(OpenMajors "$major" | tr '\n' ' ')
+            other_open_majors="${other_open_majors% }"
+            if [ -n "$other_open_majors" ]; then
+              prior_furthest=$(MajorFurthestStage "$major" "$tag" || true)
+              if [ -n "$prior_furthest" ]; then
+                new_idx=$(StageIndex "$CANDIDATE_ORIGIN" || true)
+                old_idx=$(StageIndex "$prior_furthest" || true)
+                if [ -n "$new_idx" ] && [ -n "$old_idx" ] && [ "$new_idx" -lt "$old_idx" ]; then
+                  echo "[ERRO] TAG '$tag' corrige o MAJOR $major voltando pra '$CANDIDATE_ORIGIN', mas esse MAJOR já tinha alcançado '$prior_furthest'. Com outro(s) MAJOR(s) aberto(s) agora (MAJOR $other_open_majors), não é permitido voltar — corrija a partir de '$prior_furthest' (ou mais avançado), trate esse conteúdo como parte do MAJOR $other_open_majors, ou cancele um dos fluxos antes de continuar. Pipeline bloqueado."
+                  return 1
+                fi
+              fi
+            fi
+          fi
+
+        #-----------------------
+        # Aqui cai no SE ele não for maior que 1 = rc0 ou rc1
+        #-----------------------
+        else
+          if [ "$rc_num" -ne 1 ]; then
+            echo "[ERRO] TAG '$tag' é a primeira candidata da versão '$core', mas não é '-rc1' (recebida: rc$rc_num). Pipeline bloqueado."
+            return 1
+          fi
+
+          first_stage="${STAGE_CHAIN%% *}"
+          first_stage_tier=$(TierStages "$first_stage" | tr '\n' '/')
+          first_stage_tier="${first_stage_tier%/}"
+          first_stage_tier_list=$(TierStages "$first_stage" | tr '\n' ' ')
+          case " $first_stage_tier_list " in
+            *" $CANDIDATE_ORIGIN "*) : ;;
+            *)
+              echo "[ERRO] TAG '$tag' é a primeira candidata de uma versão nova (MAJOR $major) — precisa nascer no primeiro andar existente no fluxo ('$first_stage_tier'), mas foi criada em '$CANDIDATE_ORIGIN'. Pipeline bloqueado."
+              return 1
+              ;;
+          esac
+
+          #-----------------------
+          # Descobre entre as rcN do fluxo atual e as cores ja publicadas qual deveria ser a
+          # proxima MAJOR, exemplo a última valida é v6, deveria ser v7
+          #-----------------------
+          highest_major=""
+          for cand_tag in $(git tag --list 'v*' --sort=-v:refname); do
+            cand_core="${cand_tag%%-rc*}"
+            [ "$cand_core" = "$core" ] && continue
+            cand_major="${cand_core#v}"
+            cand_major="${cand_major%%.*}"
+            # Só conta MAJOR menor ou igual ao que está sendo validado — um MAJOR maior
+            # significa que abriu DEPOIS (outro fluxo), não é relevante pra saber se ESTE
+            # aqui foi sequencial quando nasceu. Sem isso, revalidar a rc1 de um MAJOR
+            # antigo (numa promoção, por ex.) quebra assim que um MAJOR novo abre depois.
+            [ "$cand_major" -gt "$major" ] 2>/dev/null && continue
+
+            case "$cand_tag" in
+              *-rc*)
+                cand_sha=$(git rev-parse "$cand_tag" 2>/dev/null || true)
+                cand_matched=false
+                for cand_check_stage in $(TierStages "$first_stage"); do
+                  cand_check_branch=$(StageBranch "$cand_check_stage")
+                  [ -z "$cand_check_branch" ] && continue
+                  if git merge-base --is-ancestor "$cand_sha" "origin/$cand_check_branch" 2>/dev/null; then
+                    cand_matched=true
+                    break
+                  fi
+                done
+                [ "$cand_matched" = "true" ] || continue
+                ;;
+              *)
+                cand_sha=$(git rev-parse "$cand_tag" 2>/dev/null || true)
+                if [ -z "$MASTER_REAL_BRANCH" ] || ! git merge-base --is-ancestor "$cand_sha" "origin/$MASTER_REAL_BRANCH" 2>/dev/null; then
+                  continue
+                fi
+                ;;
+            esac
+
+            if [ -z "$highest_major" ] || [ "$cand_major" -gt "$highest_major" ]; then
+              highest_major="$cand_major"
+            fi
+          done
+          if [ -n "$highest_major" ]; then
+            expected_major=$((highest_major + 1))
+            if [ "$major" -ne "$expected_major" ]; then
+              echo "[ERRO] TAG '$tag' abre MAJOR $major, mas já existe(m) tag(s) com MAJOR $highest_major no repositório. Próximo MAJOR precisa ser sequencial: v${expected_major}.0.0-rc1, ou exclua as tags lixo para seguir corretamente o fluxo. Pipeline bloqueado."
+              return 1
+            fi
+          fi
+
+          #-----------------------
+          # Pega a última tag publicada em produção e verifica se dev ja recebeu essa versão, como
+          # estamos no if rc1 deveria estar tudo alinhado
+          #-----------------------
+
+          #-----------------------
+          # Pega a última tag publicada em produção e verifica se o estágio de ORIGEM DE
+          # VERDADE (dev ou qa, o que a tag realmente usou — não necessariamente "o primeiro
+          # da lista") já recebeu essa versão, já que é ele quem está iniciando o fluxo novo.
+          #-----------------------
+          first_stage_branch=$(StageBranch "$CANDIDATE_ORIGIN")
+          latest_published=""
+          if [ -n "$MASTER_REAL_BRANCH" ]; then
+            latest_published=$(git tag --list 'v*' --sort=-v:refname --merged "origin/$MASTER_REAL_BRANCH" | grep -Ev -- '-rc[0-9]+$' | head -n1 || true)
+          fi
+          if [ -n "$latest_published" ]; then
+            latest_published_sha=$(git rev-parse "$latest_published")
+            if ! git merge-base --is-ancestor "$latest_published_sha" "origin/$first_stage_branch" 2>/dev/null; then
+              echo "[ERRO] '$CANDIDATE_ORIGIN' ($first_stage_branch) ainda não recebeu a última tag publicada em produção ('$latest_published') — falta a cascata dela até '$first_stage_branch' antes de começar uma versão nova (qa/hml podem seguir defasados até o novo fluxo alcançá-los via promotion). Pipeline bloqueado."
+              return 1
+            fi
+
+            novo_conteudo=$(git rev-list --no-merges "${latest_published_sha}..${sha}" 2>/dev/null || true)
+            if [ -z "$novo_conteudo" ]; then
+              echo "[ERRO] TAG '$tag' não traz nenhum commit além da última tag publicada ('$latest_published') — não há o que liberar num MAJOR novo. Pipeline bloqueado."
+              return 1
+            fi
+          fi
+
+          echo "[INFO] Primeira candidata da versão '$core' — rc1 em '$CANDIDATE_ORIGIN' (primeiro estágio do fluxo), estágios seguintes alinhados e em dia com a última tag publicada"
+        fi
+
+        if git rev-parse "$core" >/dev/null 2>&1; then
+          echo "[ERRO] TAG '$tag' é candidata da versão '$core', mas essa versão já foi publicada como tag final. Não é possível reabrir uma versão já publicada como candidata — corte um hotfix/minor a partir de produção (seção 3.2), ou avance pra uma versão nova. Pipeline bloqueado."
+          return 1
+        fi
+
+        #-----------------------
+        # Aqui só verifica questão de versão, no mesmo MAJOR, exemplo, não posso subir um v1.1.0 se
+        # ja existe um v1.2.0
+        #-----------------------
+        prev_tag=$(git tag --list "v${major}.*" --sort=-v:refname | grep -vFx "$tag" | head -n1 || true)
+        if [ -n "$prev_tag" ]; then
+          prev_core="${prev_tag%%-rc*}"
+          prev_rest="${prev_core#v${major}.}"
+          prev_minor="${prev_rest%%.*}"
+          prev_patch="${prev_rest#*.}"
+          if [ "$minor" -lt "$prev_minor" ] 2>/dev/null || { [ "$minor" -eq "$prev_minor" ] 2>/dev/null && [ "$patch" -lt "$prev_patch" ] 2>/dev/null; }; then
+            echo "[ERRO] TAG '$tag' regride versão em relação a '$prev_tag'. Pipeline bloqueado."
+            return 1
+          fi
+        fi
+
+        #-----------------------
+        # Aviso (não bloqueia): esse conteúdo carrega candidata de outro MAJOR aberto
+        # na ancestralidade — pode ser fluxo compartilhando o mesmo branch sem problema
+        # (decisão de processo), mas fica registrado no log pra quem for revisar.
+        #-----------------------
+        cross_major_hit=$(CrossMajorAncestors "$major" "$sha" || true)
+        if [ -n "$cross_major_hit" ]; then
+          echo "[AVISO] TAG '$tag' (MAJOR $major) tem na ancestralidade candidata(s) de outro MAJOR ainda aberto: $cross_major_hit — conteúdo dos dois fluxos pode estar misturado a partir daqui (branch compartilhado). Não bloqueia; confira se é intencional."
+        fi
+
+        CANDIDATE_MAJOR="$major"
+        return 0
+      }
+
+      #-----------------------
+      # Confirma se o sha é ancestral do branch de produção (main).
+      #-----------------------
+      IsAncestorOfMaster() {
+        local sha="$1"
+        [ -n "$MASTER_REAL_BRANCH" ] && git merge-base --is-ancestor "$sha" "origin/$MASTER_REAL_BRANCH" 2>/dev/null
+      }
+
+      # ============================================================
+      # = BRANCHES DOS ESTÁGIOS (nomes padronizados: dev, qa, hml, main)
+      # ============================================================
+
+      DEV_BRANCH_ALIASES="dev"
+      QA_BRANCH_ALIASES="qa"
+      HOMOLOG_BRANCH_ALIASES="hml"
+
+      FindAliasBranch() {
+        local candidates="$1"
+        local aliases="$2"
+        local alias
+        local found
+
+        for alias in $aliases; do
+          found=$(echo "$candidates" | grep -ix "$alias" | head -n1)
+          if [ -n "$found" ]; then
+            echo "$found"
+            return 0
+          fi
+        done
+
+        return 1
+      }
+
+      # ============================================================
+      # = CADEIA DE ESTÁGIOS
+      # ============================================================
+
+      StageBranch() {
+        case "$1" in
+          dev) printf "%s" "$DEV_REAL_BRANCH" ;;
+          qa) printf "%s" "$QA_REAL_BRANCH" ;;
+          hml) printf "%s" "$HOMOLOG_REAL_BRANCH" ;;
+        esac
+      }
+
+      StagePredecessor() {
+        local target="$1" prev=""
+        for s in $STAGE_CHAIN; do
+          if [ "$s" = "$target" ]; then
+            [ -n "$prev" ] && echo "$prev"
+            return 0
+          fi
+          prev="$s"
+        done
+        return 1
+      }
+
+      StageSuccessors() {
+        local target="$1" found=false
+        for s in $STAGE_CHAIN; do
+          if [ "$found" = "true" ]; then
+            echo "$s"
+          fi
+          [ "$s" = "$target" ] && found=true
+        done
+      }
+
+      #-----------------------
+      # Posição (1-based) de um estágio dentro de STAGE_CHAIN — usado só pra
+      # comparar "quem está mais avançado", não pra achar branch.
+      #-----------------------
+      StageIndex() {
+        local target="$1" i=0 s
+        for s in $STAGE_CHAIN; do
+          i=$((i + 1))
+          if [ "$s" = "$target" ]; then
+            echo "$i"
+            return 0
+          fi
+        done
+        return 1
+      }
+
+      #-----------------------
+      # Dev e QA agora são a mesma coisa
+      #-----------------------
+
+      TierPredecessorBranches() {
+        case "$1" in
+          hml)
+            [ -n "$DEV_REAL_BRANCH" ] && printf "%s\n" "$DEV_REAL_BRANCH"
+            [ -n "$QA_REAL_BRANCH" ] && printf "%s\n" "$QA_REAL_BRANCH"
+            ;;
+        esac
+        return 0
+      }
+
+      TierSuccessorStages() {
+        case "$1" in
+          dev|qa)
+            [ -n "$HOMOLOG_REAL_BRANCH" ] && echo "hml"
+            ;;
+        esac
+        return 0
+      }
+
+      #-----------------------
+      # Lista os estágios (labels) que estão no MESMO andar que o informado —
+      # dev e qa retornam os dois (os que existirem), hml retorna só ele mesmo.
+      #-----------------------
+      TierStages() {
+        case "$1" in
+          dev|qa)
+            [ -n "$DEV_REAL_BRANCH" ] && echo "dev"
+            [ -n "$QA_REAL_BRANCH" ] && echo "qa"
+            ;;
+          *)
+            echo "$1"
+            ;;
+        esac
+        return 0
+      }
+
+      #-----------------------
+      # Lista os MAJORs "abertos" no repositório (existe -rcN, mas nenhuma
+      # tag final publicada ainda), excluindo o major informado.
+      #-----------------------
+      OpenMajors() {
+        local exclude="$1" t core rest m seen="" final
+        for t in $(git tag --list 'v*-rc*' 2>/dev/null); do
+          core="${t%%-rc*}"
+          rest="${core#v}"
+          m="${rest%%.*}"
+          [ "$m" = "$exclude" ] && continue
+          case " $seen " in *" $m "*) continue ;; esac
+          seen="$seen $m"
+          final=$(git tag --list "v${m}.*" 2>/dev/null | grep -Ev -- '-rc[0-9]+$' | head -n1 || true)
+          [ -z "$final" ] && echo "$m"
+        done
+        return 0
+      }
+
+      #-----------------------
+      # Estágio mais avançado que um MAJOR já alcançou, olhando toda -rcN dele
+      # (exceto a tag informada em $2, tipicamente a que está sendo validada agora)
+      #-----------------------
+      MajorFurthestStage() {
+        local m="$1" exclude_tag="$2" s branch t t_sha
+        for s in hml qa dev; do
+          case " $STAGE_CHAIN " in *" $s "*) ;; *) continue ;; esac
+          branch=$(StageBranch "$s")
+          [ -z "$branch" ] && continue
+          for t in $(git tag --list "v${m}.0.0-rc*" 2>/dev/null); do
+            [ "$t" = "$exclude_tag" ] && continue
+            t_sha=$(git rev-parse "$t" 2>/dev/null || true)
+            if [ -n "$t_sha" ] && git merge-base --is-ancestor "$t_sha" "origin/$branch" 2>/dev/null; then
+              echo "$s"
+              return 0
+            fi
+          done
+        done
+        return 1
+      }
+
+      #-----------------------
+      # Detecta (sem bloquear) se o sha informado carrega na ancestralidade alguma
+      # candidata de OUTRO MAJOR ainda aberto — sinal de que o conteúdo dos dois
+      # fluxos pode estar misturado a partir daqui (branch compartilhado). Não dá
+      # pra saber se é intencional ou não, só avisar — decidir o que fazer com isso
+      # é responsabilidade de quem opera o projeto / envio-report, não do template.
+      # Retorna 1 (sem eco nenhum) quando não acha nada — chamar sempre com "|| true".
+      #-----------------------
+      CrossMajorAncestors() {
+        local this_major="$1" sha="$2" other_major other_tag other_sha found=""
+        for other_major in $(OpenMajors "$this_major"); do
+          for other_tag in $(git tag --list "v${other_major}.0.0-rc*" 2>/dev/null); do
+            other_sha=$(git rev-parse "$other_tag" 2>/dev/null || true)
+            if [ -n "$other_sha" ] && git merge-base --is-ancestor "$other_sha" "$sha" 2>/dev/null; then
+              found="$found $other_tag"
+              break
+            fi
+          done
+        done
+        found="${found# }"
+        [ -z "$found" ] && return 1
+        echo "$found"
+        return 0
+      }
+
+      # ============================================================
+      # = IDENTIFICAÇÃO DE TAG
+      # ============================================================
+
+      for i in 1 2 3; do
+        # recalculado a cada tentativa: um --unshallow que completou parcialmente não pode ser repetido
+        if [ "$(git rev-parse --is-shallow-repository 2>/dev/null || echo false)" = "true" ]; then
+          FETCH_ARGS="--unshallow --tags --prune --prune-tags --force"
+        else
+          FETCH_ARGS="--tags --prune --prune-tags --force"
+        fi
+        # shellcheck disable=SC2086
+        git fetch $FETCH_ARGS && break
+        if [ "$i" = "3" ]; then
+          echo "[ERRO] git fetch das tags falhou após 3 tentativas (rede, permissão do job ou repositório indisponível). Pipeline bloqueado."
+          exit 1
+        fi
+        echo "[AVISO] git fetch falhou (tentativa $i/3) — repetindo..."
+        sleep 5
+      done
+
+      EFFECTIVE_BRANCH="${CI_COMMIT_BRANCH:-${CI_MERGE_REQUEST_TARGET_BRANCH_NAME:-}}"
+
+      echo "[INFO] CI_COMMIT_BRANCH    : ${CI_COMMIT_BRANCH:-}"
+      echo "[INFO] EFFECTIVE_BRANCH    : ${EFFECTIVE_BRANCH:-}"
+
+      REMOTE_BRANCHES=""
+      for i in 1 2 3; do
+        if LS_REMOTE_OUT=$(git ls-remote --heads origin 2>&1); then
+          REMOTE_BRANCHES=$(printf '%s\n' "$LS_REMOTE_OUT" | awk -F'refs/heads/' 'NF>1 {print $2}')
+          break
+        fi
+        echo "[AVISO] git ls-remote falhou (tentativa $i/3): $LS_REMOTE_OUT"
+        if [ "$i" = "3" ]; then
+          echo "[ERRO] Não foi possível listar os branches do remoto (rede, permissão do job ou repositório indisponível). Pipeline bloqueado."
+          exit 1
+        fi
+        sleep 5
+      done
+      if [ -z "$REMOTE_BRANCHES" ]; then
+        echo "[ERRO] git ls-remote não retornou nenhum branch. Pipeline bloqueado."
+        exit 1
+      fi
+      DEV_REAL_BRANCH=$(FindAliasBranch "$REMOTE_BRANCHES" "$DEV_BRANCH_ALIASES" || true)
+      QA_REAL_BRANCH=$(FindAliasBranch "$REMOTE_BRANCHES" "$QA_BRANCH_ALIASES" || true)
+      HOMOLOG_REAL_BRANCH=$(FindAliasBranch "$REMOTE_BRANCHES" "$HOMOLOG_BRANCH_ALIASES" || true)
+
+      MASTER_REAL_BRANCH=$(FindAliasBranch "$REMOTE_BRANCHES" "main" || true)
+
+      for ENTRY in "DEV_REAL_BRANCH:$DEV_REAL_BRANCH" "QA_REAL_BRANCH:$QA_REAL_BRANCH" "HOMOLOG_REAL_BRANCH:$HOMOLOG_REAL_BRANCH" "MASTER_REAL_BRANCH:$MASTER_REAL_BRANCH"; do
+        ENTRY_LABEL="${ENTRY%%:*}"
+        ENTRY_BRANCH="${ENTRY#*:}"
+        if [ -n "$ENTRY_BRANCH" ]; then
+          git fetch origin "$ENTRY_BRANCH" 2>/dev/null || true
+        fi
+        printf "[INFO] %-19s: %s\n" "$ENTRY_LABEL" "${ENTRY_BRANCH:-<nenhum>}"
+      done
+
+      EFFECTIVE_BRANCH_CATEGORY="$EFFECTIVE_BRANCH"
+      if [ -n "$DEV_REAL_BRANCH" ] && [ "$EFFECTIVE_BRANCH" = "$DEV_REAL_BRANCH" ]; then
+        EFFECTIVE_BRANCH_CATEGORY="dev"
+      elif [ -n "$QA_REAL_BRANCH" ] && [ "$EFFECTIVE_BRANCH" = "$QA_REAL_BRANCH" ]; then
+        EFFECTIVE_BRANCH_CATEGORY="qa"
+      elif [ -n "$HOMOLOG_REAL_BRANCH" ] && [ "$EFFECTIVE_BRANCH" = "$HOMOLOG_REAL_BRANCH" ]; then
+        EFFECTIVE_BRANCH_CATEGORY="hml"
+      elif [ "$EFFECTIVE_BRANCH" = "main" ]; then
+        EFFECTIVE_BRANCH_CATEGORY="production"
+      fi
+      echo "[INFO] EFFECTIVE_BRANCH_CATEGORY : $EFFECTIVE_BRANCH_CATEGORY"
+
+      STAGE_CHAIN=""
+      for STAGE_LABEL in dev qa hml; do
+        STAGE_REAL_BRANCH=$(StageBranch "$STAGE_LABEL")
+        [ -n "$STAGE_REAL_BRANCH" ] && STAGE_CHAIN="$STAGE_CHAIN $STAGE_LABEL"
+      done
+      STAGE_CHAIN="${STAGE_CHAIN# }"
+      echo "[INFO] STAGE_CHAIN (estágios existentes no remoto, em ordem) : ${STAGE_CHAIN:-<nenhum>}"
+
+      TARGET_RESULT=$(FindPromotedTag "${CI_COMMIT_BEFORE_SHA:-}")
+      if [ -z "${CI_COMMIT_TAG:-}" ] && [ "${TARGET_RESULT%% *}" = "AMBIGUOUS" ]; then
+        echo "[ERRO] Múltiplas tags novas apontam pro mesmo commit promovido: ${TARGET_RESULT#AMBIGUOUS }. Ambíguo — remova a(s) tag(s) que não faz(em) parte deste fluxo. Pipeline bloqueado."
+        exit 1
+      fi
+      TARGET_TAG=$(echo "$TARGET_RESULT" | awk '{print $1}')
+      TARGET_COMMIT=$(echo "$TARGET_RESULT" | awk '{print $2}')
+      TARGET_TAG="${TARGET_TAG:-NENHUMA_TAG}"
+
+      # ============================================================
+      # = DEFININDO PROCESSO
+      # ============================================================
+
+      if [ -n "${CI_COMMIT_TAG:-}" ]; then
+        echo "[INFO] TAG detectada: $CI_COMMIT_TAG"
+
+        if ! echo "$CI_COMMIT_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-rc[0-9]+)?$'; then
+          echo "[ERRO] TAG '$CI_COMMIT_TAG' fora do padrão vX.Y.Z ou vX.Y.Z-rcN. Pipeline bloqueado."
+          exit 1
+        fi
+
+        TAG_CORE="${CI_COMMIT_TAG%%-rc*}"
+        TAG_REST="${TAG_CORE#v}"
+        TAG_MAJOR="${TAG_REST%%.*}"
+        TAG_REST="${TAG_REST#*.}"
+        TAG_MINOR="${TAG_REST%%.*}"
+        TAG_PATCH="${TAG_REST#*.}"
+
+        case "$CI_COMMIT_TAG" in
+          *-rc*)
+            TAG_IS_CANDIDATE=true
+            TAG_RC="${CI_COMMIT_TAG##*-rc}"
+            ;;
+          *)
+            TAG_IS_CANDIDATE=false
+            TAG_RC=""
+            ;;
+        esac
+        echo "[INFO] Core: v${TAG_MAJOR}.${TAG_MINOR}.${TAG_PATCH} | candidata: $TAG_IS_CANDIDATE | rc: ${TAG_RC:-<final>}"
+
+        TAG_SHA=$(git rev-parse "$CI_COMMIT_TAG")
+
+        if [ -z "$DEV_REAL_BRANCH" ] && [ -z "$QA_REAL_BRANCH" ] && [ -z "$HOMOLOG_REAL_BRANCH" ]; then
+          echo "[ERRO] Nenhum branch de origem encontrado (dev, qa ou hml). Pipeline bloqueado."
+          exit 1
+        fi
+
+        #-----------------------
+        # Confirma se o a tag é rcN
+        #-----------------------
+        if [ "$TAG_IS_CANDIDATE" = "true" ]; then
+          ValidateCandidateTag "$CI_COMMIT_TAG" "$TAG_SHA" || exit 1
+
+          #-----------------------
+          # Tag é sempre por commit e não por branch, digamos que dev e qa estejam no mesmo sha
+          # final, quando criar a tag não da pra saber a origin dela.
+          #-----------------------
+          if [ -n "$CANDIDATE_ORIGIN_AMBIGUOUS" ]; then
+            echo "[ERRO] TAG '$CI_COMMIT_TAG' foi empurrada direto (sem branch) e o commit dela está igualmente limpo em mais de um estágio ao mesmo tempo (${CANDIDATE_ORIGIN_AMBIGUOUS}) — provavelmente os branches ficaram com conteúdo idêntico (ex: merge cruzado). Não dá pra determinar com segurança em qual ambiente publicar. Apague essa tag e recrie a partir do estágio pretendido de verdade, ou diferencie os branches (ex: um commit de sincronização) antes de taguear. Pipeline bloqueado."
+            exit 1
+          fi
+
+          DefineVariavel PIPELINE_PROCESS tag
+          DefineVariavel PIPELINE_ENV "$CANDIDATE_ORIGIN"
+          DefineVariavel PIPELINE_TAG "$CI_COMMIT_TAG"
+          DefineVariavel PIPELINE_TAG_KIND candidata
+
+          PIPELINE_MAJOR="$CANDIDATE_MAJOR"
+          DefineVariavel PIPELINE_MAJOR "$PIPELINE_MAJOR"
+
+        #-----------------------
+        # Confirma se a tag é só vX.Y.Z
+        #-----------------------
+        else
+          if ! IsAncestorOfMaster "$TAG_SHA"; then
+            echo "[ERRO] TAG final '$CI_COMMIT_TAG' não pertence ao histórico de main. Pipeline bloqueado."
+            exit 1
+          fi
+
+          LAST_RC=$(git tag --list "${TAG_CORE}-rc*" --merged "$TAG_SHA" --sort=-v:refname | head -n1 || true)
+
+          #-----------------------
+          # Ele identifica se existe algum -rcN com o mesmo core parado em main
+          # = promovendo uma rc, ai ele verifica se tem conteudo além de conflito
+          #-----------------------
+          if [ -n "$LAST_RC" ]; then
+            LAST_RC_SHA=$(git rev-parse "$LAST_RC")
+            EXTRA_CONTEUDO=$(git rev-list --no-merges "${LAST_RC_SHA}..${TAG_SHA}" 2>/dev/null || true)
+            if [ -n "$EXTRA_CONTEUDO" ]; then
+              echo "[ERRO] TAG final '$CI_COMMIT_TAG' traz conteúdo além da candidata '$LAST_RC' - pipeline bloqueado."
+              echo "[ERRO] Commit(s) fora da candidata:"
+              echo "$EXTRA_CONTEUDO"
+              exit 1
+            fi
+            echo "[INFO] TAG final sem conteúdo além da candidata '$LAST_RC' — graduação válida"
+            FINAL_TAG_PROCESS="promotion"
+          #-----------------------
+          # Aqui só pode ser hotfix ou minor, ai precisa ver minor e patch e se está em ordem,
+          # ancestralidade, cadeia correta...
+          #-----------------------
+          else
+            echo "[INFO] Sem candidata '${TAG_CORE}-rcN' no histórico — verificando a última tag final publicada no repositório pra tratar '$CI_COMMIT_TAG' como hotfix"
+
+            LAST_FINAL=$(git tag --list 'v*' --sort=-v:refname \
+              | grep -Ev -- '-rc[0-9]+$' \
+              | grep -vFx "$CI_COMMIT_TAG" \
+              | head -n1 || true)
+
+            if [ -z "$LAST_FINAL" ]; then
+              echo "[ERRO] TAG final '$CI_COMMIT_TAG' não tem candidata '${TAG_CORE}-rcN' nem nenhuma final anterior no repositório."
+              echo "[ERRO] Nenhuma release nunca completou o fluxo (nunca teve uma tag final validada em ${MASTER_REAL_BRANCH:-main}) — não pode nascer como hotfix. Corte a candidata '${TAG_CORE}-rcN' e siga o fluxo normal (dev/qa/hml) antes de gerar essa versão. Pipeline bloqueado."
+              exit 1
+            fi
+
+            LAST_FINAL_REST="${LAST_FINAL#v}"
+            LAST_FINAL_MAJOR="${LAST_FINAL_REST%%.*}"
+            LAST_FINAL_REST="${LAST_FINAL_REST#*.}"
+            LAST_FINAL_MINOR="${LAST_FINAL_REST%%.*}"
+            LAST_FINAL_PATCH="${LAST_FINAL_REST#*.}"
+
+            #-----------------------
+            # Verifica se o sha que quero publicar é descendent e do último publicado
+            #-----------------------
+            LAST_FINAL_SHA=$(git rev-parse "$LAST_FINAL")
+            if ! git merge-base --is-ancestor "$LAST_FINAL_SHA" "$TAG_SHA" 2>/dev/null; then
+              echo "[ERRO] TAG final '$CI_COMMIT_TAG' não descende de '$LAST_FINAL' (última publicada) no histórico do git — desconectada da release anterior. Pipeline bloqueado."
+              exit 1
+            fi
+
+            #-----------------------
+            # Verifica se existe conteudo novo além do último publicado
+            #-----------------------
+            NOVO_CONTEUDO=$(git rev-list --no-merges "${LAST_FINAL_SHA}..${TAG_SHA}" 2>/dev/null || true)
+            if [ -z "$NOVO_CONTEUDO" ]; then
+              echo "[ERRO] TAG '$CI_COMMIT_TAG' não traz nenhum commit além da última publicada ('$LAST_FINAL') — não há o que liberar. Pipeline bloqueado."
+              exit 1
+            fi
+
+            #-----------------------
+            # Verifica se o numeração e ordenação da tag está correta comparado com a última.
+            #-----------------------
+            if [ "$TAG_MAJOR" = "$LAST_FINAL_MAJOR" ] && [ "$TAG_MINOR" = "$LAST_FINAL_MINOR" ] \
+              && [ "$TAG_PATCH" -eq "$((LAST_FINAL_PATCH + 1))" ] 2>/dev/null; then
+              echo "[INFO] Hotfix válido: PATCH novo sobre '$LAST_FINAL', que é a última tag final publicada em ${MASTER_REAL_BRANCH:-main} — fluxo anterior confirmado completo"
+              FINAL_TAG_PROCESS="hotfix"
+            elif [ "$TAG_MAJOR" = "$LAST_FINAL_MAJOR" ] \
+              && [ "$((10#$TAG_MINOR))" -eq "$((10#$LAST_FINAL_MINOR + 1))" ] 2>/dev/null \
+              && [ "$TAG_PATCH" = "0" ]; then
+              echo "[INFO] Minor alterada em produção (alteração grande): '$LAST_FINAL' -> '$CI_COMMIT_TAG', última tag final publicada em ${MASTER_REAL_BRANCH:-main} — fluxo anterior confirmado completo"
+              FINAL_TAG_PROCESS="minor"
+            else
+              echo "[ERRO] TAG '$CI_COMMIT_TAG' não é uma evolução válida sobre a última publicada ('$LAST_FINAL')."
+              echo "[ERRO] Esperado: hotfix 'v${LAST_FINAL_MAJOR}.${LAST_FINAL_MINOR}.$((LAST_FINAL_PATCH + 1))' (patch) ou minor 'v${LAST_FINAL_MAJOR}.$((10#$LAST_FINAL_MINOR + 1)).0' (alteração grande). Pipeline bloqueado."
+              exit 1
+            fi
+          fi
+
+          #-----------------------
+          # Mesmo aviso (não bloqueia) que as candidatas já recebem: se o conteúdo que
+          # está indo pra produção carrega na ancestralidade alguma candidata de outro
+          # MAJOR ainda aberto, fica registrado.
+          #-----------------------
+          cross_major_hit_final=$(CrossMajorAncestors "$TAG_MAJOR" "$TAG_SHA" || true)
+          if [ -n "$cross_major_hit_final" ]; then
+            echo "[AVISO] TAG final '$CI_COMMIT_TAG' (MAJOR $TAG_MAJOR) tem na ancestralidade candidata(s) de outro MAJOR ainda aberto: $cross_major_hit_final — conteúdo dos dois fluxos pode estar misturado nessa publicação (branch compartilhado). Não bloqueia; confira se é intencional."
+          fi
+
+          DefineVariavel PIPELINE_PROCESS "$FINAL_TAG_PROCESS"
+          DefineVariavel PIPELINE_ENV production
+          DefineVariavel PIPELINE_TAG "$CI_COMMIT_TAG"
+          DefineVariavel PIPELINE_TAG_KIND final
+
+          #-----------------------
+          # Tag final que veio de uma candidata: a imagem não é reconstruída, só
+          # recebe a tag final apontando pro mesmo digest da candidata validada.
+          #-----------------------
+          if [ "$FINAL_TAG_PROCESS" = "promotion" ]; then
+            DefineVariavel PIPELINE_SOURCE_TAG "$LAST_RC"
+          fi
+
+          PIPELINE_MAJOR="$TAG_MAJOR"
+          DefineVariavel PIPELINE_MAJOR "$PIPELINE_MAJOR"
+        fi
+
+      #-----------------------
+      # Aqui é caso de promotion de branch
+      #-----------------------
+      elif [ "$TARGET_TAG" != "NENHUMA_TAG" ]; then
+          echo "[INFO] Promotion confirmada via tag: $TARGET_TAG"
+
+          if [ -n "${CI_COMMIT_BEFORE_SHA:-}" ] && [ "$CI_COMMIT_BEFORE_SHA" != "0000000000000000000000000000000000000000" ]; then
+            PACKAGE_RANGE="${CI_COMMIT_BEFORE_SHA}..HEAD"
+          else
+            PACKAGE_RANGE="HEAD"
+          fi
+
+          EXTRA_COMMITS=$(git rev-list --no-merges "$PACKAGE_RANGE" --not "$TARGET_COMMIT" 2>/dev/null || true)
+          if [ -n "$EXTRA_COMMITS" ]; then
+            echo "[ERRO] Este merge trouxe commit(s) de conteúdo além do pacote da tag '$TARGET_TAG' - pipeline bloqueado."
+            echo "[ERRO] Commit(s) fora da tag:"
+            echo "$EXTRA_COMMITS"
+            exit 1
+          fi
+          echo "[INFO] Pacote OK: nada além da tag '$TARGET_TAG' (e dos merges estruturais) foi trazido"
+
+          if [ "$EFFECTIVE_BRANCH_CATEGORY" = "production" ]; then
+            echo "[ERRO] Push de branch em '${EFFECTIVE_BRANCH:-}' não publica mais produção. Corte a tag final (vX.Y.Z, sem -rc) sobre esse merge. Pipeline bloqueado."
+            exit 1
+          fi
+
+          #-----------------------
+          # Verifica se essa promotion é candidata ou rollback
+          #-----------------------
+          case " $STAGE_CHAIN " in
+            *" $EFFECTIVE_BRANCH_CATEGORY "*)
+              if echo "$TARGET_TAG" | grep -Eq -- '-rc[0-9]+$'; then
+                # ------------------------------------------------------
+                # CANDIDATA
+                # ------------------------------------------------------
+
+                ValidateCandidateTag "$TARGET_TAG" "$TARGET_COMMIT" "promotion" || exit 1
+
+                #-----------------------
+                # Em caso de new pipeline apontando para uma branch com tag na ponta
+                # gitlab não entrega ci_commit_tag, isso é pra salvar isso.
+                #-----------------------
+                if [ "$CANDIDATE_ORIGIN" = "$EFFECTIVE_BRANCH_CATEGORY" ]; then
+                  if [ "${CI_PIPELINE_SOURCE:-}" = "push" ]; then
+                    echo "[ERRO] Push de commit em '${EFFECTIVE_BRANCH:-}' não publica: a TAG '$TARGET_TAG' nasceu direto em '$EFFECTIVE_BRANCH_CATEGORY' e quem publica é o pipeline da própria tag. Para reexecutar a partir do branch use Run pipeline. Pipeline bloqueado."
+                    exit 1
+                  fi
+                  echo "[INFO] TAG '$TARGET_TAG' já nasceu direto em '$EFFECTIVE_BRANCH_CATEGORY' (correção) — reexecução sem novidade, nada a revalidar contra o predecessor."
+                else
+                  PRED_BRANCHES=$(TierPredecessorBranches "$EFFECTIVE_BRANCH_CATEGORY")
+                  #-----------------------
+                  # dev e qa contam como o mesmo andar agora — basta ter passado por QUALQUER
+                  # um dos dois (os que existirem) pra satisfazer o andar anterior de hml.
+                  #-----------------------
+                  if [ -n "$PRED_BRANCHES" ]; then
+                    PRED_OK=false
+                    PRED_MATCHED_BRANCH=""
+                    for PRED_BRANCH in $PRED_BRANCHES; do
+                      if git merge-base --is-ancestor "$TARGET_COMMIT" "origin/$PRED_BRANCH" 2>/dev/null; then
+                        PRED_OK=true
+                        PRED_MATCHED_BRANCH="$PRED_BRANCH"
+                        break
+                      fi
+                    done
+                    if [ "$PRED_OK" != "true" ]; then
+                      echo "[ERRO] TAG '$TARGET_TAG' não tem origem em nenhum destes (dev/qa contam como o mesmo andar): $(echo "$PRED_BRANCHES" | tr '\n' ' '). Etapa obrigatória não cumprida - pipeline bloqueado."
+                      exit 1
+                    fi
+
+                    #-----------------------
+                    # Verifica se em QUALQUER branch do andar anterior já existe uma tag mais
+                    # recente do mesmo core do que a que estou tentando subir.
+                    #-----------------------
+                    TARGET_TAG_CORE="${TARGET_TAG%%-rc*}"
+                    PRED_ALL_MATCHES=$(for PRED_BRANCH in $PRED_BRANCHES; do
+                      git tag --list "${TARGET_TAG_CORE}-rc*" --merged "origin/$PRED_BRANCH" 2>/dev/null
+                    done | sort -u | grep -v '^$' || true)
+                    LATEST_PRED_CANDIDATE=""
+                    if [ -n "$PRED_ALL_MATCHES" ]; then
+                      LATEST_PRED_RC_NUM=$(echo "$PRED_ALL_MATCHES" | sed -E 's/.*-rc([0-9]+)$/\1/' | sort -n | tail -1)
+                      LATEST_PRED_CANDIDATE="${TARGET_TAG_CORE}-rc${LATEST_PRED_RC_NUM}"
+                    fi
+                    if [ -n "$LATEST_PRED_CANDIDATE" ] && [ "$LATEST_PRED_CANDIDATE" != "$TARGET_TAG" ]; then
+                      echo "[ERRO] TAG '$TARGET_TAG' está desatualizada: o andar anterior (dev/qa) já validou uma candidata mais recente da mesma versão ('$LATEST_PRED_CANDIDATE'). Promova '$LATEST_PRED_CANDIDATE' em vez de '$TARGET_TAG'. Pipeline bloqueado."
+                      exit 1
+                    fi
+
+                    echo "[INFO] Sequência OK: candidata '$TARGET_TAG' com origem em '$PRED_MATCHED_BRANCH' (andar dev/qa)"
+                  else
+                    echo "[INFO] '$EFFECTIVE_BRANCH_CATEGORY' é o primeiro andar existente no remoto — sem predecessor a validar"
+                  fi
+                fi
+              else
+                # ------------------------------------------------------
+                # ROLLBACK
+                # ------------------------------------------------------
+
+                # ------------------------------------------------------
+                # Se é rollback precisa ter vindo de main
+                # ------------------------------------------------------
+                if ! IsAncestorOfMaster "$TARGET_COMMIT"; then
+                  echo "[ERRO] TAG final '$TARGET_TAG' não é uma versão validada em '${MASTER_REAL_BRANCH:-main}' — rollback inválido. Pipeline bloqueado."
+                  exit 1
+                fi
+
+                # ------------------------------------------------------
+                # Verifica se o rollback foi feito em todas as branchs. dev e qa contam
+                # como o mesmo andar - cascatear pra qualquer um dos dois só exige
+                # hml/main, não exige o outro par (dev/qa) também estar atualizado.
+                # ------------------------------------------------------
+                for SUCC_STAGE in $(TierSuccessorStages "$EFFECTIVE_BRANCH_CATEGORY"); do
+                  SUCC_BRANCH=$(StageBranch "$SUCC_STAGE")
+                  if ! git merge-base --is-ancestor "$TARGET_COMMIT" "origin/$SUCC_BRANCH" 2>/dev/null; then
+                    echo "[ERRO] Rollback de '$TARGET_TAG' para '$EFFECTIVE_BRANCH_CATEGORY' inválido: essa versão ainda não está validada em '$SUCC_BRANCH' ($SUCC_STAGE). Rollback precisa seguir a ordem main → ... → $EFFECTIVE_BRANCH_CATEGORY, sem pular estágios. Pipeline bloqueado."
+                    exit 1
+                  fi
+                done
+
+                echo "[INFO] Rollback válido: '$TARGET_TAG' já validada em main e em todos os estágios intermediários até '$EFFECTIVE_BRANCH_CATEGORY'"
+              fi
+              ;;
+          esac
+
+          DefineVariavel PIPELINE_PROCESS promotion
+          DefineVariavel PIPELINE_ENV "$EFFECTIVE_BRANCH_CATEGORY"
+          DefineVariavel PIPELINE_TAG "$TARGET_TAG"
+
+          PIPELINE_MAJOR="${TARGET_TAG#v}"
+          PIPELINE_MAJOR="${PIPELINE_MAJOR%%.*}"
+          DefineVariavel PIPELINE_MAJOR "$PIPELINE_MAJOR"
+
+      else
+        echo "[ERRO] Commit em '${EFFECTIVE_BRANCH:-}' não corresponde a nenhum fluxo de deploy (não é tag, promotion ou hotfix). Pipeline bloqueada."
+        exit 1
+      fi
+
+      DefineVariavel SKIP_REPORT "${SKIP_REPORT:-false}"
+      DefineVariavel SKIP_SECURITY "${SKIP_SECURITY:-false}"
+      DefineVariavel SKIP_DEPLOY "${SKIP_DEPLOY:-false}"
+
+      # ========================================================
+      # LOG FINAL
+      # ========================================================
+
+      echo "======================================"
+      echo "= VARIÁVEIS GERADAS"
+      echo "======================================"
+
+      while IFS='=' read -r key value; do
+        [ -z "$key" ] && continue
+        printf "[INFO] %-20s: %s\n" "$key" "$value"
+      done < context.env
+  artifacts:
+    reports:
+      dotenv: context.env
+
+# ============================================================
+# =         DEFINIÇÃO DE BUILD_KIND / DEPLOY_KIND (JOB 2)
+# ============================================================
+# Valida o contrato mínimo do projeto consumidor antes de disparar o pipeline
+# filho — erro de configuração aparece aqui, não no meio do build.
+.definir-kind:
+  stage: kind
+  image: alpine:3.22
+  tags:
+    - $RUNNER_TAG
+  variables:
+    GIT_STRATEGY: none
+  environment:
+    name: $PIPELINE_ENV
+    action: prepare
+  script:
+    - |
+      set -eu
+      rm -f context.env || true
+
+      echo "======================================"
+      echo "= DEFININDO BUILD_KIND / DEPLOY_KIND"
+      echo "======================================"
+      echo "[INFO] PIPELINE_ENV   : ${PIPELINE_ENV:-}"
+      echo "[INFO] APP_TECHNOLOGY : ${APP_TECHNOLOGY:-}"
+
+      DefineVariavel() {
+        echo "${1}=$(printf "%s" "$2")" >> context.env
+      }
+
+      Exige() {
+        for var in "$@"; do
+          if [ -z "$(printenv "$var" || true)" ]; then
+            echo "[ERRO] Variável obrigatória ausente para APP_TECHNOLOGY '${APP_TECHNOLOGY:-}': $var"
+            exit 1
+          fi
+        done
+      }
+
+      # APP_TECHNOLOGY: "dotnet", "angular" ou "dotnet angular" (monorepo — mesma
+      # tag/versão pro repositório inteiro, imagens promovidas juntas).
+      BUILD_DOTNET=false
+      BUILD_ANGULAR=false
+      IMAGE_NAMES=""
+      [ -n "${APP_TECHNOLOGY:-}" ] || { echo "[ERRO] APP_TECHNOLOGY não definido. Valores aceitos: dotnet, angular ou 'dotnet angular'"; exit 1; }
+
+      for tech in $APP_TECHNOLOGY; do
+        case "$tech" in
+          dotnet)
+            Exige DOTNET_SOLUTION DOTNET_APPS
+            for entry in $DOTNET_APPS; do
+              case "$entry" in
+                *=*.csproj) IMAGE_NAMES="$IMAGE_NAMES ${entry%%=*}" ;;
+                *)
+                  echo "[ERRO] Item inválido em DOTNET_APPS: '$entry' — formato esperado: nome=caminho/Projeto.csproj (separados por espaço)"
+                  exit 1
+                  ;;
+              esac
+            done
+            if [ -n "${EF_PROJECT:-}" ]; then
+              [ -n "${EF_STARTUP_PROJECT:-}" ] || { echo "[ERRO] EF_PROJECT definido sem EF_STARTUP_PROJECT"; exit 1; }
+              IMAGE_NAMES="$IMAGE_NAMES migrator"
+            fi
+            BUILD_DOTNET=true
+            ;;
+          angular)
+            Exige ANGULAR_DIST_PATH
+            IMAGE_NAMES="$IMAGE_NAMES ${ANGULAR_APP_NAME:-web}"
+            BUILD_ANGULAR=true
+            ;;
+          *)
+            echo "[ERRO] APP_TECHNOLOGY contém '$tech'. Valores aceitos: dotnet, angular ou 'dotnet angular'"
+            exit 1
+            ;;
+        esac
+      done
+
+      # Cada nome vira imagem e Deployment — repetido, um sobrescreveria o outro.
+      DUP=$(printf '%s\n' $IMAGE_NAMES | sort | uniq -d)
+      if [ -n "$DUP" ]; then
+        echo "[ERRO] Nome de app repetido entre DOTNET_APPS / ANGULAR_APP_NAME / migrator: $DUP"
+        exit 1
+      fi
+
+      DefineVariavel BUILD_KIND "$(echo $APP_TECHNOLOGY | tr " " "+")"   # informativo; dotenv não lida bem com espaço
+      DefineVariavel BUILD_DOTNET "$BUILD_DOTNET"
+      DefineVariavel BUILD_ANGULAR "$BUILD_ANGULAR"
+      DefineVariavel DEPLOY_KIND kubernetes
+
+      echo "======================================"
+      echo "= VARIÁVEIS GERADAS"
+      echo "======================================"
+      while IFS='=' read -r key value; do
+        [ -z "$key" ] && continue
+        printf "[INFO] %-20s: %s\n" "$key" "$value"
+      done < context.env
+  artifacts:
+    reports:
+      dotenv: context.env

@@ -1,0 +1,179 @@
+# ============================================================
+# =               TEMPLATE DEPLOY - KUBERNETES
+# ============================================================
+# Deploy via GitLab Agent for Kubernetes (o cluster abre conexão de saída pro
+# GitLab — nenhuma API do Kubernetes exposta, nenhum kubeconfig guardado no CI).
+#
+# Sequência:
+#   1. migrations (só .NET com EF_PROJECT): Job no cluster rodando o efbundle,
+#      com a connection string lida de um Secret do próprio cluster
+#   2. kustomize: troca a imagem de cada app pelo digest e aplica o overlay do ambiente
+#   3. rollout status de cada Deployment — falhou, desfaz (rollout undo) e reprova
+#
+# Banco é só pra frente: o rollback volta a imagem, não o schema. Migrations
+# precisam ser compatíveis com a versão anterior da app (expand/contract).
+#
+# Variáveis com ESCOPO DE AMBIENTE (GitLab → Settings → CI/CD → Variables):
+#   KUBE_CONTEXT     contexto do agent, ex: meu-grupo/meu-projeto:qa
+#                    vazio = ambiente sem cluster → deploy pulado (ex: dev)
+#   K8S_NAMESPACE    namespace da app no cluster
+#   APP_URL          URL pública do ambiente (environment url, smoke-test, ZAP)
+#
+# Variáveis do projeto (defaults):
+#   K8S_OVERLAY_DIR      deploy/k8s/overlays  → aplica deploy/k8s/overlays/<PIPELINE_ENV>
+#   MIGRATION_SECRET     <CI_PROJECT_NAME>-db (Secret com a connection string)
+#   MIGRATION_SECRET_KEY connection
+#   ROLLOUT_TIMEOUT      5m
+#   MIGRATION_TIMEOUT    600 (segundos)
+#
+# Nos manifests, a imagem de cada app é referenciada só pelo nome (ex: "image: api")
+# e o Deployment tem o mesmo nome da app — é assim que o kustomize sabe o que trocar.
+.deploy-kubernetes:
+  stage: deploy
+  image:
+    name: alpine/k8s:1.37.1
+    entrypoint: [""]
+  tags:
+    - $RUNNER_TAG
+  timeout: 30 minutes
+  resource_group: deploy-$PIPELINE_ENV
+  environment:
+    name: $PIPELINE_ENV
+    url: $APP_URL
+  variables:
+    K8S_OVERLAY_DIR: deploy/k8s/overlays
+    MIGRATION_SECRET: $CI_PROJECT_NAME-db
+    MIGRATION_SECRET_KEY: connection
+    ROLLOUT_TIMEOUT: 5m
+    MIGRATION_TIMEOUT: "600"
+  script:
+    - |
+      set -eu
+
+      if [ -z "${KUBE_CONTEXT:-}" ]; then
+        echo "[INFO] KUBE_CONTEXT não definido para o ambiente '$PIPELINE_ENV' — sem cluster, deploy pulado"
+        exit 0
+      fi
+      if [ -z "${K8S_NAMESPACE:-}" ]; then
+        echo "[ERRO] K8S_NAMESPACE não definido para o ambiente '$PIPELINE_ENV'"
+        exit 1
+      fi
+      if [ -z "${IMAGE_REFS:-}" ]; then
+        echo "[ERRO] IMAGE_REFS ausente — o dotenv do job de imagem não chegou"
+        exit 1
+      fi
+
+      OVERLAY="$K8S_OVERLAY_DIR/$PIPELINE_ENV"
+      if [ ! -f "$OVERLAY/kustomization.yaml" ]; then
+        echo "[ERRO] $OVERLAY/kustomization.yaml não encontrado"
+        exit 1
+      fi
+
+      kubectl config use-context "$KUBE_CONTEXT"
+      NS="$K8S_NAMESPACE"
+
+      echo "======================================"
+      echo "= DEPLOY $PIPELINE_TAG → $PIPELINE_ENV ($NS)"
+      echo "======================================"
+
+      APPS=""
+      MIGRATOR_REF=""
+      for pair in $(echo "$IMAGE_REFS" | tr ',' ' '); do
+        name="${pair%%=*}"
+        ref="${pair#*=}"
+        if [ "$name" = "migrator" ]; then
+          MIGRATOR_REF="$ref"
+        else
+          APPS="$APPS $name"
+        fi
+      done
+
+      # ------------------------------------------------------------
+      # 1. MIGRATIONS
+      # ------------------------------------------------------------
+      if [ -n "$MIGRATOR_REF" ]; then
+        JOB="$CI_PROJECT_NAME-migrate-$CI_PIPELINE_ID"
+        echo "[INFO] Migrations: Job $JOB ($MIGRATOR_REF)"
+
+        kubectl -n "$NS" apply -f - <<YAML
+      apiVersion: batch/v1
+      kind: Job
+      metadata:
+        name: $JOB
+        labels:
+          app.kubernetes.io/part-of: $CI_PROJECT_NAME
+          app.kubernetes.io/component: migrations
+      spec:
+        backoffLimit: 0
+        ttlSecondsAfterFinished: 86400
+        template:
+          spec:
+            restartPolicy: Never
+            containers:
+              - name: migrate
+                image: $MIGRATOR_REF
+                args: ["--connection", "\$(DB_CONNECTION)"]
+                env:
+                  - name: DB_CONNECTION
+                    valueFrom:
+                      secretKeyRef:
+                        name: $MIGRATION_SECRET
+                        key: $MIGRATION_SECRET_KEY
+                securityContext:
+                  allowPrivilegeEscalation: false
+                  runAsNonRoot: true
+      YAML
+
+        STATUS=""
+        i=0
+        while [ "$i" -lt "$MIGRATION_TIMEOUT" ]; do
+          succeeded=$(kubectl -n "$NS" get job "$JOB" -o jsonpath='{.status.succeeded}' 2>/dev/null || true)
+          failed=$(kubectl -n "$NS" get job "$JOB" -o jsonpath='{.status.failed}' 2>/dev/null || true)
+          if [ "${succeeded:-0}" -ge 1 ]; then STATUS=ok; break; fi
+          if [ "${failed:-0}" -ge 1 ]; then STATUS=failed; break; fi
+          sleep 5
+          i=$((i + 5))
+        done
+
+        echo "----- log das migrations -----"
+        kubectl -n "$NS" logs "job/$JOB" --all-containers || true
+        echo "------------------------------"
+
+        case "$STATUS" in
+          ok) echo "[INFO] Migrations aplicadas" ;;
+          failed) echo "[ERRO] Migrations falharam — deploy da app NÃO foi feito"; exit 1 ;;
+          *) echo "[ERRO] Migrations não terminaram em ${MIGRATION_TIMEOUT}s — deploy da app NÃO foi feito"; exit 1 ;;
+        esac
+      fi
+
+      # ------------------------------------------------------------
+      # 2. KUSTOMIZE (imagem por digest)
+      # ------------------------------------------------------------
+      cd "$OVERLAY"
+      for pair in $(echo "$IMAGE_REFS" | tr ',' ' '); do
+        name="${pair%%=*}"
+        [ "$name" = "migrator" ] && continue
+        kustomize edit set image "$name=${pair#*=}"
+      done
+      kubectl apply -n "$NS" -k .
+
+      # ------------------------------------------------------------
+      # 3. ROLLOUT
+      # ------------------------------------------------------------
+      FAILED=""
+      for name in $APPS; do
+        echo "[INFO] Aguardando rollout: deployment/$name"
+        if ! kubectl -n "$NS" rollout status "deployment/$name" --timeout="$ROLLOUT_TIMEOUT"; then
+          FAILED="$FAILED $name"
+        fi
+      done
+
+      if [ -n "$FAILED" ]; then
+        echo "[ERRO] Rollout falhou em:$FAILED — desfazendo"
+        for name in $FAILED; do
+          kubectl -n "$NS" rollout undo "deployment/$name" || true
+        done
+        exit 1
+      fi
+
+      echo "[INFO] Deploy de $PIPELINE_TAG concluído em $PIPELINE_ENV"

@@ -1,0 +1,63 @@
+# ============================================================
+# =              TEMPLATE REVIEW - GATE DE CODE REVIEW
+# ============================================================
+# Opt-in (REVIEW_GATE_ENABLED: "true"), só em push de feature/*.
+# Nenhuma IA roda aqui — só confere a prova deixada pelo /code-review local:
+#
+#   .pi/code-review-ok.json  {"commit": "<sha revisado>", ...}
+#
+# O sha precisa ser o do próprio push. Bateu: abre a MR pra dev automaticamente.
+# Não bateu ou não existe: pipeline vermelha, nenhuma MR — rode /code-review de novo.
+#
+# Abrir MR exige GITLAB_TOKEN (project access token, escopo api, role Developer)
+# como variável mascarada do projeto — o CI_JOB_TOKEN não cria MR.
+.verify-code-review:
+  stage: review
+  image: alpine:3.22
+  tags:
+    - $RUNNER_TAG
+  timeout: 5 minutes
+  script:
+    - |
+      set -eu
+      PROOF=.pi/code-review-ok.json
+      if [ ! -f "$PROOF" ]; then
+        echo "[ERRO] $PROOF não encontrado. Rode /code-review antes do push."
+        exit 1
+      fi
+
+      apk add --no-cache jq >/dev/null
+      REVIEWED_SHA=$(jq -r '.commit // empty' "$PROOF")
+      if [ "$REVIEWED_SHA" != "$CI_COMMIT_SHA" ]; then
+        echo "[ERRO] $PROOF é do commit '${REVIEWED_SHA:-<vazio>}', o push é $CI_COMMIT_SHA. Rode /code-review de novo."
+        exit 1
+      fi
+      echo "[INFO] Code review OK para $CI_COMMIT_SHA"
+
+.abrir-mr-dev:
+  stage: review
+  image:
+    name: registry.gitlab.com/gitlab-org/cli:v1.119.0
+    entrypoint: [""]
+  tags:
+    - $RUNNER_TAG
+  timeout: 5 minutes
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - |
+      set -eu
+      if [ -z "${GITLAB_TOKEN:-}" ]; then
+        echo "[ERRO] GITLAB_TOKEN não definido no projeto — sem ele não dá pra abrir a MR"
+        exit 1
+      fi
+      EXISTENTE=$(glab mr list --repo "$CI_PROJECT_PATH" --source-branch "$CI_COMMIT_BRANCH" --target-branch dev 2>/dev/null | grep -c "^!" || true)
+      if [ "$EXISTENTE" -gt 0 ]; then
+        echo "[INFO] MR $CI_COMMIT_BRANCH → dev já existe — nada a fazer"
+        exit 0
+      fi
+      glab mr create --repo "$CI_PROJECT_PATH" \
+        --source-branch "$CI_COMMIT_BRANCH" --target-branch dev \
+        --title "$CI_COMMIT_BRANCH" \
+        --description "Aberta automaticamente pelo verify-code-review (commit $CI_COMMIT_SHORT_SHA)." \
+        --yes

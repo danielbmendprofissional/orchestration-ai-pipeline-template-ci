@@ -1,0 +1,103 @@
+# ============================================================
+# =                       BASE RULES
+# ============================================================
+#
+#   PIPELINE_PROCESS : tag | promotion | hotfix | minor   (controlar-pipeline)
+#   BUILD_KIND       : dotnet | angular | dotnet+angular  (informativo)
+#   BUILD_DOTNET / BUILD_ANGULAR : true | false           (definir-kind — monorepo liga os dois)
+#   DEPLOY_KIND      : kubernetes                         (definir-kind)
+#
+#   Build once / deploy many: só tag (candidata), hotfix e minor compilam e
+#   geram imagem. Promotion reaproveita a imagem da tag (mesmo digest), e a tag
+#   final vinda de candidata só recebe a tag nova apontando pro mesmo digest.
+#
+
+.rules-controlar-pipeline:
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: on_success
+    - if: '$CI_COMMIT_BRANCH =~ /^(qa|hml|main)$/'
+      when: on_success
+    - when: never
+
+.rules-review:
+  rules:
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\// && $REVIEW_GATE_ENABLED == "true"'
+      when: on_success
+    - when: never
+
+.rules-build-dotnet:
+  rules:
+    - if: '$BUILD_DOTNET == "true" && $PIPELINE_PROCESS =~ /^(tag|hotfix|minor)$/'
+      when: on_success
+    - when: never
+
+.rules-build-angular:
+  rules:
+    - if: '$BUILD_ANGULAR == "true" && $PIPELINE_PROCESS =~ /^(tag|hotfix|minor)$/'
+      when: on_success
+    - when: never
+
+.rules-test-dotnet:
+  rules:
+    - if: '$BUILD_DOTNET == "true" && $PIPELINE_PROCESS =~ /^(tag|hotfix|minor)$/ && $DOTNET_TESTS != null && $DOTNET_TESTS != ""'
+      when: on_success
+    - when: never
+
+.rules-test-angular:
+  rules:
+    - if: '$BUILD_ANGULAR == "true" && $PIPELINE_PROCESS =~ /^(tag|hotfix|minor)$/ && $TEST_COMMAND != null && $TEST_COMMAND != ""'
+      when: on_success
+    - when: never
+
+.rules-image:
+  rules:
+    - if: '$PIPELINE_PROCESS =~ /^(tag|promotion|hotfix|minor)$/'
+      when: on_success
+    - when: never
+
+# Scans de código: só quando há build (o código de uma promotion é o mesmo da tag).
+.rules-security-code:
+  rules:
+    - if: '$SKIP_SECURITY == "true"'
+      when: never
+    - if: '$PIPELINE_PROCESS =~ /^(tag|hotfix|minor)$/'
+      when: on_success
+    - when: never
+
+# Scan da imagem e gate: toda pipeline — CVE novo pode ter surgido desde o build.
+.rules-security-image:
+  rules:
+    - if: '$SKIP_SECURITY == "true"'
+      when: never
+    - if: '$PIPELINE_PROCESS =~ /^(tag|promotion|hotfix|minor)$/'
+      when: on_success
+    - when: never
+
+.rules-deploy:
+  rules:
+    - if: '$SKIP_DEPLOY == "true"'
+      when: never
+    - if: '$DEPLOY_KIND == "kubernetes" && $PIPELINE_ENV == "production"'
+      when: manual
+      allow_failure: false
+    - if: '$DEPLOY_KIND == "kubernetes"'
+      when: on_success
+    - when: never
+
+.rules-smoke-test:
+  rules:
+    - if: '$SKIP_DEPLOY == "true"'
+      when: never
+    - if: '$DEPLOY_KIND == "kubernetes"'
+      when: on_success
+    - when: never
+
+# DAST só nos ambientes de validação — nunca atacar produção, nem passivamente.
+.rules-dast:
+  rules:
+    - if: '$SKIP_DEPLOY == "true" || $SKIP_SECURITY == "true"'
+      when: never
+    - if: '$DEPLOY_KIND == "kubernetes" && $PIPELINE_ENV =~ /^(qa|hml)$/'
+      when: on_success
+    - when: never

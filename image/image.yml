@@ -1,0 +1,201 @@
+# ============================================================
+# =                 TEMPLATE IMAGEM (REGISTRY)
+# ============================================================
+# Build once / deploy many. Um job, três modos, decididos pelo controlar-pipeline:
+#
+#   build    tag (candidata), hotfix, minor   → docker build + push :$PIPELINE_TAG
+#   retag    tag final vinda de candidata      → :$PIPELINE_SOURCE_TAG ganha também :$PIPELINE_TAG
+#                                                (mesmo digest — nada é recompilado)
+#   resolve  promotion / rollback              → só confirma que :$PIPELINE_TAG existe
+#
+# Em todos os modos o resultado é o digest de cada imagem (image.env, dotenv),
+# e é por digest — nunca por tag — que o deploy e o scan de imagem trabalham.
+#
+# Imagens geradas ($CI_REGISTRY_IMAGE/<nome>):
+#   dotnet   um por item de DOTNET_APPS + "migrator" (se EF_PROJECT definido)
+#   angular  ANGULAR_APP_NAME (default web)
+#   monorepo (APP_TECHNOLOGY "dotnet angular") → todas acima, mesma tag, promovidas juntas
+#
+# nginx do Angular: <ANGULAR_WORKDIR>/nginx/*.template (ou NGINX_CONF_DIR, relativo à raiz).
+#
+# Dockerfile: se existir docker/<nome>.Dockerfile no projeto, ele é usado (contexto =
+# raiz do repo, com publish/ disponível). Senão, o template gera um padrão.
+#
+# Requer runner com privileged = true (docker:dind).
+.image:
+  stage: image
+  image: docker:29.9.1-cli
+  services:
+    - name: docker:29.9.1-dind
+      alias: docker
+  tags:
+    - $RUNNER_TAG
+  timeout: 30 minutes
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+    DOTNET_RUNTIME_IMAGE: mcr.microsoft.com/dotnet/aspnet:10.0
+    DOTNET_RUNTIME_DEPS_IMAGE: mcr.microsoft.com/dotnet/runtime-deps:10.0
+    NGINX_IMAGE: nginxinc/nginx-unprivileged:1.31-alpine
+    ANGULAR_APP_NAME: web
+  script:
+    - |
+      set -eu
+
+      for i in 1 2 3 4 5 6; do
+        docker info >/dev/null 2>&1 && break
+        [ "$i" = "6" ] && { echo "[ERRO] docker:dind não respondeu — o runner precisa de privileged = true"; exit 1; }
+        sleep 3
+      done
+      echo "$CI_JOB_TOKEN" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+
+      # ------------------------------------------------------------
+      # Lista de imagens deste projeto
+      # ------------------------------------------------------------
+      # "nome:tipo" — monorepo junta as duas tecnologias na mesma lista
+      IMAGES=""
+      if [ "${BUILD_DOTNET:-false}" = "true" ]; then
+        for entry in $DOTNET_APPS; do IMAGES="$IMAGES ${entry%%=*}:dotnet"; done
+        if [ -n "${EF_PROJECT:-}" ]; then IMAGES="$IMAGES migrator:migrator"; fi
+      fi
+      if [ "${BUILD_ANGULAR:-false}" = "true" ]; then
+        IMAGES="$IMAGES $ANGULAR_APP_NAME:angular"
+      fi
+      if [ -z "$IMAGES" ]; then
+        echo "[ERRO] Nenhuma imagem a gerar — BUILD_DOTNET/BUILD_ANGULAR não chegaram do definir-kind"
+        exit 1
+      fi
+
+      # nginx/*.template do Angular: junto do projeto Angular (ANGULAR_WORKDIR) por padrão
+      NGINX_DIR="${NGINX_CONF_DIR:-${ANGULAR_WORKDIR:+$ANGULAR_WORKDIR/}nginx}"
+
+      MODE=resolve
+      case "$PIPELINE_PROCESS" in
+        tag|hotfix|minor) MODE=build ;;
+        promotion)
+          case "${PIPELINE_TAG_KIND:-}:${PIPELINE_SOURCE_TAG:-}" in
+            final:v*) MODE=retag ;;
+          esac
+          ;;
+      esac
+
+      echo "======================================"
+      echo "= IMAGEM — modo: $MODE"
+      echo "======================================"
+      echo "[INFO] PIPELINE_PROCESS : $PIPELINE_PROCESS"
+      echo "[INFO] PIPELINE_TAG     : $PIPELINE_TAG"
+      echo "[INFO] SOURCE_TAG       : ${PIPELINE_SOURCE_TAG:-}"
+      echo "[INFO] Imagens          :$IMAGES"
+
+      # ------------------------------------------------------------
+      # Dockerfiles padrão (usados quando o projeto não traz o seu)
+      # ------------------------------------------------------------
+      GerarDockerfile() {
+        name="$1"; kind="$2"; out="$3"
+        if [ "$kind" = "angular" ]; then
+          if [ ! -f "$CI_PROJECT_DIR/$NGINX_DIR/app.conf.template" ]; then
+            echo "[ERRO] $NGINX_DIR/app.conf.template não encontrado — copie o exemplo de examples/angular/nginx do template-ci"
+            exit 1
+          fi
+          {
+            echo "FROM $NGINX_IMAGE"
+            echo "USER root"
+            echo "RUN rm -f /etc/nginx/conf.d/default.conf"
+            echo "COPY publish/$name/ /usr/share/nginx/html/"
+            echo "COPY $NGINX_DIR/ /etc/nginx/templates/"
+            # defaults das variáveis do nginx/*.template — o envsubst só troca variável definida
+            echo "ENV APP_RUNTIME_CONFIG='{}' \\"
+            echo "    CSP_SCRIPT_SRC=\"'self'\" \\"
+            echo "    CSP_STYLE_SRC=\"'self' 'unsafe-inline'\" \\"
+            echo "    CSP_FONT_SRC=\"'self'\" \\"
+            echo "    CSP_IMG_SRC=\"'self' data:\" \\"
+            echo "    CSP_CONNECT_SRC=\"'self'\" \\"
+            echo "    CSP_FRAME_SRC=\"'none'\""
+            echo "USER 101"
+            echo "EXPOSE 8080"
+          } > "$out"
+        elif [ "$kind" = "migrator" ]; then
+          {
+            echo "FROM $DOTNET_RUNTIME_DEPS_IMAGE"
+            echo "WORKDIR /app"
+            echo "COPY publish/migrator/ ./"
+            echo "USER \$APP_UID"
+            echo 'ENTRYPOINT ["./efbundle"]'
+          } > "$out"
+        else
+          assembly=$(cat "publish/$name/.assembly")
+          {
+            echo "FROM $DOTNET_RUNTIME_IMAGE"
+            echo "WORKDIR /app"
+            echo "COPY publish/$name/ ./"
+            echo "ENV ASPNETCORE_HTTP_PORTS=8080"
+            echo "EXPOSE 8080"
+            echo "USER \$APP_UID"
+            echo "ENTRYPOINT [\"dotnet\", \"$assembly.dll\"]"
+          } > "$out"
+        fi
+      }
+
+      # ------------------------------------------------------------
+      # Execução
+      # ------------------------------------------------------------
+      : > image.env
+      REFS=""
+      for item in $IMAGES; do
+        name="${item%%:*}"
+        kind="${item#*:}"
+        repo="$CI_REGISTRY_IMAGE/$name"
+        echo "--------------------------------------"
+        echo "[INFO] $name → $repo"
+
+        case "$MODE" in
+          build)
+            if [ ! -d "publish/$name" ]; then
+              echo "[ERRO] publish/$name ausente — o artifact do build não chegou (confira o needs do job)"
+              exit 1
+            fi
+            dockerfile="docker/$name.Dockerfile"
+            if [ -f "$dockerfile" ]; then
+              echo "[INFO] Dockerfile do projeto: $dockerfile"
+            else
+              dockerfile=".ci-docker/$name.Dockerfile"
+              mkdir -p .ci-docker
+              GerarDockerfile "$name" "$kind" "$dockerfile"
+              echo "[INFO] Dockerfile padrão do template:"
+              cat "$dockerfile"
+            fi
+
+            docker build -f "$dockerfile" -t "$repo:$PIPELINE_TAG" \
+              --label "org.opencontainers.image.source=$CI_PROJECT_URL" \
+              --label "org.opencontainers.image.revision=$CI_COMMIT_SHA" \
+              --label "org.opencontainers.image.version=$PIPELINE_TAG" \
+              .
+            docker push "$repo:$PIPELINE_TAG"
+            ;;
+          retag)
+            echo "[INFO] $repo:$PIPELINE_SOURCE_TAG → $repo:$PIPELINE_TAG (sem rebuild)"
+            docker buildx imagetools create --tag "$repo:$PIPELINE_TAG" "$repo:$PIPELINE_SOURCE_TAG"
+            ;;
+        esac
+
+        if ! INSPECT=$(docker buildx imagetools inspect "$repo:$PIPELINE_TAG" 2>&1); then
+          echo "[ERRO] Imagem $repo:$PIPELINE_TAG não encontrada no registry: $INSPECT"
+          echo "[ERRO] Promotion/rollback precisa de uma imagem já gerada pela tag — ela foi apagada do registry?"
+          exit 1
+        fi
+        digest=$(printf '%s\n' "$INSPECT" | awk '/^Digest:/ {print $2; exit}')
+        if [ -z "$digest" ]; then
+          echo "[ERRO] Não foi possível obter o digest de $repo:$PIPELINE_TAG"
+          exit 1
+        fi
+
+        ref="$repo@$digest"
+        echo "[INFO] Digest: $ref"
+        REFS="${REFS:+$REFS,}$name=$ref"
+      done
+
+      echo "IMAGE_REFS=$REFS" >> image.env
+      echo "[INFO] IMAGE_REFS=$REFS"
+  artifacts:
+    reports:
+      dotenv: image.env

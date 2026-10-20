@@ -1,0 +1,12 @@
+# Um overlay por ambiente: dev, qa, hml, production (nome = PIPELINE_ENV).
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: meu-projeto
+resources:
+  - ../../base
+  - ingress.yaml
+configMapGenerator:
+  - name: web-config
+    literals:
+      - APP_RUNTIME_CONFIG={"apiUrl":"https://api.qa.meu-projeto.dev"}
+      - CSP_CONNECT_SRC='self' https://api.qa.meu-projeto.dev

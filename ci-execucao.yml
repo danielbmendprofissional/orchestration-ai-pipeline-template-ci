@@ -1,0 +1,182 @@
+# ============================================================
+# =                 TEMPLATE BASE - EXECUTOR
+# ============================================================
+# Pipeline filho. Ordem lógica:
+#   build → test → image → security → gate → deploy → verify
+# Os scans de código não dependem do build e começam junto com ele (needs: []).
+include:
+  - project: orchestration-ai/ai-pipeline/template-ci
+    ref: v2.0.0
+    file:
+      - /common/rules.yml
+      - /build/dotnet.yml
+      - /build/angular.yml
+      - /test/dotnet.yml
+      - /test/angular.yml
+      - /image/image.yml
+      - /security/trivy.yml
+      - /security/opengrep.yml
+      - /security/checkov.yml
+      - /security/betterleaks.yml
+      - /security/gate.yml
+      - /security/zap.yml
+      - /deploy/kubernetes.yml
+      - /verify/smoke-test.yml
+
+variables:
+  RUNNER_TAG: "self-hosted"
+
+stages:
+  - build
+  - test
+  - image
+  - security
+  - gate
+  - deploy
+  - verify
+
+# ============================================================
+# = BUILD
+# ============================================================
+build-dotnet:
+  extends: .build-dotnet
+  rules:
+    - !reference [.rules-build-dotnet, rules]
+
+build-angular:
+  extends: .build-angular
+  rules:
+    - !reference [.rules-build-angular, rules]
+
+# ============================================================
+# = TEST
+# ============================================================
+test-dotnet:
+  extends: .test-dotnet
+  needs: []
+  rules:
+    - !reference [.rules-test-dotnet, rules]
+
+test-angular:
+  extends: .test-angular
+  needs: []
+  rules:
+    - !reference [.rules-test-angular, rules]
+
+# ============================================================
+# = IMAGEM (build once / deploy many)
+# ============================================================
+image:
+  extends: .image
+  needs:
+    - job: build-dotnet
+      artifacts: true
+      optional: true
+    - job: build-angular
+      artifacts: true
+      optional: true
+    - job: test-dotnet
+      optional: true
+    - job: test-angular
+      optional: true
+  rules:
+    - !reference [.rules-image, rules]
+
+# ============================================================
+# = SEGURANÇA – SCAN
+# ============================================================
+security-trivy-fs:
+  extends: .trivy-fs
+  needs:
+    - job: build-dotnet
+      artifacts: true
+      optional: true
+    - job: build-angular
+      artifacts: true
+      optional: true
+  rules:
+    - !reference [.rules-security-code, rules]
+
+security-opengrep:
+  extends: .opengrep
+  needs: []
+  rules:
+    - !reference [.rules-security-code, rules]
+
+security-checkov:
+  extends: .checkov
+  needs: []
+  rules:
+    - !reference [.rules-security-code, rules]
+
+security-betterleaks:
+  extends: .betterleaks
+  needs: []
+  rules:
+    - !reference [.rules-security-code, rules]
+
+security-trivy-image:
+  extends: .trivy-image
+  needs:
+    - job: image
+      artifacts: true
+  rules:
+    - !reference [.rules-security-image, rules]
+
+# ============================================================
+# = GATE (agregação + bloqueio por severidade)
+# ============================================================
+security-gate:
+  extends: .security-gate
+  needs:
+    - job: security-trivy-fs
+      optional: true
+    - job: security-opengrep
+      optional: true
+    - job: security-checkov
+      optional: true
+    - job: security-betterleaks
+      optional: true
+    - job: security-trivy-image
+      optional: true
+  rules:
+    - !reference [.rules-security-image, rules]
+
+# ============================================================
+# = DEPLOY
+# ============================================================
+deploy:
+  extends: .deploy-kubernetes
+  needs:
+    - job: image
+      artifacts: true
+    - job: security-gate
+      artifacts: false
+      optional: true
+  rules:
+    - !reference [.rules-deploy, rules]
+
+# ============================================================
+# = VERIFICAÇÃO PÓS-DEPLOY
+# ============================================================
+smoke-test:
+  extends: .smoke-test
+  needs:
+    - job: deploy
+  rules:
+    - !reference [.rules-smoke-test, rules]
+
+dast-zap:
+  extends: .zap-baseline
+  needs:
+    - job: smoke-test
+  rules:
+    - !reference [.rules-dast, rules]
+
+dast-gate:
+  extends: .dast-gate
+  needs:
+    - job: dast-zap
+      artifacts: true
+  rules:
+    - !reference [.rules-dast, rules]

@@ -1,0 +1,35 @@
+# Exemplo: monorepo — API .NET + front Angular no mesmo repositório.
+# Uma tag/versão pro repositório inteiro: as imagens (api, worker, migrator, web)
+# são geradas juntas e promovidas juntas, pelo digest.
+#
+# Estrutura esperada:
+#   backend/MeuProjeto.slnx, backend/src/...          (.NET)
+#   frontend/package.json, frontend/angular.json      (Angular)
+#   frontend/nginx/*.template                         (copiar de examples/angular/nginx)
+#   deploy/k8s/base: api.yaml + web.yaml (um Deployment por app, nome = nome da app)
+#   deploy/k8s/overlays/<dev|qa|hml|production>       (um overlay aplica tudo)
+include:
+  - project: orchestration-ai/ai-pipeline/template-ci
+    file: /ci-template.yml
+    ref: v2.0.0
+
+variables:
+  APP_TECHNOLOGY: "dotnet angular"
+
+  # .NET — caminhos relativos à raiz do repositório
+  DOTNET_SOLUTION: backend/MeuProjeto.slnx
+  DOTNET_APPS: "api=backend/src/MeuProjeto.Api/MeuProjeto.Api.csproj"
+  DOTNET_TESTS: "backend/tests/MeuProjeto.UnitTests/MeuProjeto.UnitTests.csproj"
+  EF_PROJECT: backend/src/MeuProjeto.Infra/MeuProjeto.Infra.csproj
+  EF_STARTUP_PROJECT: backend/src/MeuProjeto.Api/MeuProjeto.Api.csproj
+
+  # Angular — ANGULAR_DIST_PATH é relativo ao ANGULAR_WORKDIR
+  ANGULAR_WORKDIR: frontend
+  ANGULAR_DIST_PATH: dist/meu-front/browser
+  ANGULAR_APP_NAME: web            # não pode repetir nome de DOTNET_APPS nem "migrator"
+  TEST_COMMAND: test:ci
+
+# Variáveis por ambiente (Environment scope):
+#   KUBE_CONTEXT, K8S_NAMESPACE
+#   APP_URL           https://qa.meu-projeto.dev            (front: smoke em /healthz + ZAP)
+#   SMOKE_EXTRA_URLS  https://api.qa.meu-projeto.dev/health  (API no host próprio)

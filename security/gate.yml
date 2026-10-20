@@ -1,0 +1,52 @@
+# ============================================================
+# =              TEMPLATE SEGURANÇA - GATE (AGREGAÇÃO)
+# ============================================================
+# Junta os relatórios brutos de todas as ferramentas (trivy-fs, trivy-image-*,
+# opengrep, checkov, betterleaks), normaliza a severidade num lugar só e decide:
+#
+#   dev          achado >= SECURITY_FAIL_ON vira AVISO (job laranja, pipeline segue)
+#   qa/hml/prod  achado >= SECURITY_FAIL_ON BLOQUEIA o deploy
+#
+# Falso positivo aceito: listar em .security-ignore na raiz do projeto
+# (uma regra por linha: "<ruleId>" ou "<ferramenta>:<ruleId>", # comenta).
+# O ignorado continua aparecendo no relatório, só não conta pro bloqueio.
+#
+# Saída: security-report/consolidated.json e consolidated.pdf (artifact).
+# Envio pra report-api: pendente — ver README (seção Pendências).
+.security-gate-base:
+  image:
+    name: ${SECURITY_SCANNER_IMAGE}
+    entrypoint: [""]
+  tags:
+    - $RUNNER_TAG
+  timeout: 10 minutes
+  variables:
+    SECURITY_SCANNER_IMAGE: registry.gitlab.com/orchestration-ai/ai-pipeline/template-ci/security-scanner:v2.0.0
+    SECURITY_FAIL_ON: "CRITICAL,HIGH"
+    SECURITY_IGNORE_FILE: .security-ignore
+  # 3 = gate reprovado em modo aviso (dev): job fica laranja, pipeline segue.
+  allow_failure:
+    exit_codes: [3]
+
+.security-gate:
+  extends: .security-gate-base
+  stage: gate
+  script:
+    - |
+      set -eu
+      set -- --input . --output security-report --export json,pdf \
+        --fail-on "$SECURITY_FAIL_ON" --target "$CI_PROJECT_PATH@$PIPELINE_TAG ($PIPELINE_ENV)"
+      if [ -f "$SECURITY_IGNORE_FILE" ]; then
+        set -- "$@" --ignore-file "$SECURITY_IGNORE_FILE"
+      fi
+      if [ "$PIPELINE_ENV" = "dev" ]; then
+        echo "[INFO] Ambiente dev — gate em modo aviso (não bloqueia)"
+        set -- "$@" --warn-only
+      fi
+      security-scanner aggregate "$@"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    expose_as: "Relatorio de seguranca"
+    paths:
+      - security-report/

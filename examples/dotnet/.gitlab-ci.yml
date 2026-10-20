@@ -1,0 +1,27 @@
+# Exemplo: API .NET 10 (+ worker opcional) com EF Core, publicada no Kubernetes.
+# Estrutura esperada no repositório:
+#   MeuProjeto.slnx
+#   src/MeuProjeto.Api/        → app "api"   (expõe /health)
+#   src/MeuProjeto.Worker/     → app "worker"
+#   src/MeuProjeto.Infra/      → migrations do EF Core
+#   deploy/k8s/base + deploy/k8s/overlays/<dev|qa|hml|production>
+include:
+  - project: orchestration-ai/ai-pipeline/template-ci
+    file: /ci-template.yml
+    ref: v2.0.0
+
+variables:
+  APP_TECHNOLOGY: dotnet
+  DOTNET_SOLUTION: MeuProjeto.slnx
+  # nome=projeto — o nome vira imagem ($CI_REGISTRY_IMAGE/api) e nome do Deployment
+  DOTNET_APPS: "api=src/MeuProjeto.Api/MeuProjeto.Api.csproj worker=src/MeuProjeto.Worker/MeuProjeto.Worker.csproj"
+  DOTNET_TESTS: "tests/MeuProjeto.UnitTests/MeuProjeto.UnitTests.csproj"
+  # migrations: sem estas duas, nada de migrator
+  EF_PROJECT: src/MeuProjeto.Infra/MeuProjeto.Infra.csproj
+  EF_STARTUP_PROJECT: src/MeuProjeto.Api/MeuProjeto.Api.csproj
+  HEALTH_PATH: /health          # convenção do ai-base (HealthChecks do .NET)
+
+# Variáveis por ambiente (GitLab → Settings → CI/CD → Variables, com Environment scope):
+#   KUBE_CONTEXT   meu-grupo/meu-projeto:qa   (vazio no dev = sem deploy)
+#   K8S_NAMESPACE  meu-projeto
+#   APP_URL        https://api.qa.meu-projeto.dev

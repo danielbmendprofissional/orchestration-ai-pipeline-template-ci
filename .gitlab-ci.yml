@@ -1,0 +1,73 @@
+# ============================================================
+# =        PIPELINE DO PRÓPRIO TEMPLATE-CI (não é o template)
+# ============================================================
+# Publica as imagens que os jobs do template consomem:
+#   $CI_REGISTRY_IMAGE/security-scanner:<tag>   (security-gate, dast-gate)
+#   $CI_REGISTRY_IMAGE/opengrep:<tag>           (security-opengrep)
+# Só em tag vX.Y.Z — a mesma tag que os projetos fixam no include.
+
+variables:
+  RUNNER_TAG: "self-hosted"
+
+workflow:
+  rules:
+    - if: '$CI_COMMIT_TAG =~ /^v[0-9]+\.[0-9]+\.[0-9]+$/'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+
+stages:
+  - check
+  - publish
+
+# Garante que o CLI compila antes de qualquer tag.
+security-scanner-build:
+  stage: check
+  image: mcr.microsoft.com/dotnet/sdk:10.0
+  tags:
+    - $RUNNER_TAG
+  script:
+    - dotnet build tools/security-scanner/src/SecurityScanner.Cli -c Release
+
+# Toda referência de versão do template precisa bater com a tag sendo publicada
+# (include ref + imagens default) — senão um projeto fixado em vX puxa arquivo de vY.
+versao-consistente:
+  stage: check
+  image: alpine:3.22
+  tags:
+    - $RUNNER_TAG
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - |
+      set -eu
+      ERRADOS=$(grep -rnE "ref: v[0-9]|template-ci/(security-scanner|opengrep):v[0-9]" --include=*.yml . \
+        | grep -v "^./.gitlab-ci.yml" | grep -v "examples/" | grep -v -- "$CI_COMMIT_TAG" || true)
+      if [ -n "$ERRADOS" ]; then
+        echo "[ERRO] Referências de versão diferentes de $CI_COMMIT_TAG:"
+        echo "$ERRADOS"
+        exit 1
+      fi
+      echo "[INFO] Todas as referências apontam para $CI_COMMIT_TAG"
+
+publicar-imagens:
+  stage: publish
+  image: docker:29.9.1-cli
+  services:
+    - name: docker:29.9.1-dind
+      alias: docker
+  tags:
+    - $RUNNER_TAG
+  variables:
+    DOCKER_HOST: tcp://docker:2375
+    DOCKER_TLS_CERTDIR: ""
+  rules:
+    - if: '$CI_COMMIT_TAG'
+  script:
+    - |
+      set -eu
+      for i in 1 2 3 4 5 6; do docker info >/dev/null 2>&1 && break; sleep 3; done
+      echo "$CI_JOB_TOKEN" | docker login -u "$CI_REGISTRY_USER" --password-stdin "$CI_REGISTRY"
+      for img in security-scanner opengrep; do
+        docker build -t "$CI_REGISTRY_IMAGE/$img:$CI_COMMIT_TAG" "tools/$img"
+        docker push "$CI_REGISTRY_IMAGE/$img:$CI_COMMIT_TAG"
+      done

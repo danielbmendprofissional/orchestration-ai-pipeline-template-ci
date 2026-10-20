@@ -1,0 +1,24 @@
+# TLS no Traefik (vem com o k3s) + cert-manager. ClusterIssuer: self-signed no k3d
+# local, Let's Encrypt nos clusters publicados.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt
+spec:
+  ingressClassName: traefik
+  tls:
+    - hosts: [api.qa.meu-projeto.dev]
+      secretName: api-tls
+  rules:
+    - host: api.qa.meu-projeto.dev
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: api
+                port:
+                  number: 80

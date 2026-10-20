@@ -1,0 +1,97 @@
+# ============================================================
+# =                   TEMPLATE BASE – CI
+# ============================================================
+# Ponto de entrada do projeto consumidor. Valida o fluxo de tag/promoção
+# (controlar-pipeline), valida o contrato do projeto (definir-kind) e dispara
+# o pipeline filho (ci-execucao) com as variáveis já resolvidas.
+include:
+  - project: orchestration-ai/ai-pipeline/template-ci
+    ref: v2.0.0
+    file:
+      - /common/controlar-pipeline.yml
+      - /common/rules.yml
+      - /review/code-review.yml
+
+variables:
+  # Tag do runner self-hosted (executor Docker, privileged — o job de imagem usa docker:dind).
+  RUNNER_TAG: "self-hosted"
+  # Gate de code review em feature/* (review/code-review.yml) — o projeto liga com "true".
+  REVIEW_GATE_ENABLED: "false"
+
+workflow:
+  name: 'Controle de pipeline — $CI_COMMIT_BRANCH$CI_COMMIT_TAG'
+  rules:
+    - if: '$CI_COMMIT_TAG'
+      when: always
+    - if: '$CI_COMMIT_BRANCH =~ /^(qa|hml|main)$/'
+      when: always
+    - if: '$CI_COMMIT_BRANCH =~ /^feature\// && $REVIEW_GATE_ENABLED == "true"'
+      when: always
+    - when: never
+
+stages:
+  - review
+  - controle
+  - kind
+  - trigger
+
+# ============================================================
+# = REVIEW (feature/* → MR pra dev)
+# ============================================================
+verify-code-review:
+  extends: .verify-code-review
+  rules: !reference [.rules-review, rules]
+
+abrir-mr-dev:
+  extends: .abrir-mr-dev
+  needs:
+    - verify-code-review
+  rules: !reference [.rules-review, rules]
+
+# ============================================================
+# = CONTROLE DE PROCESSO
+# ============================================================
+controlar-pipeline:
+  extends: .controlar-pipeline
+  rules: !reference [.rules-controlar-pipeline, rules]
+
+# ============================================================
+# = DEFINIÇÃO DE BUILD_KIND / DEPLOY_KIND
+# ============================================================
+definir-kind:
+  extends: .definir-kind
+  needs:
+    - controlar-pipeline
+  rules: !reference [.rules-controlar-pipeline, rules]
+
+# ============================================================
+# = DISPARO DO PIPELINE FILHO (EXECUÇÃO)
+# ============================================================
+disparar-execucao:
+  stage: trigger
+  needs:
+    - controlar-pipeline
+    - definir-kind
+  rules: !reference [.rules-controlar-pipeline, rules]
+  trigger:
+    include:
+      - project: orchestration-ai/ai-pipeline/template-ci
+        file: /ci-execucao.yml
+        ref: v2.0.0
+    strategy: depend
+    forward:
+      pipeline_variables: true
+  variables:
+    PIPELINE_PROCESS: $PIPELINE_PROCESS
+    PIPELINE_ENV: $PIPELINE_ENV
+    PIPELINE_TAG: $PIPELINE_TAG
+    PIPELINE_TAG_KIND: $PIPELINE_TAG_KIND
+    PIPELINE_SOURCE_TAG: $PIPELINE_SOURCE_TAG
+    PIPELINE_MAJOR: $PIPELINE_MAJOR
+    BUILD_KIND: $BUILD_KIND
+    BUILD_DOTNET: $BUILD_DOTNET
+    BUILD_ANGULAR: $BUILD_ANGULAR
+    DEPLOY_KIND: $DEPLOY_KIND
+    SKIP_REPORT: $SKIP_REPORT
+    SKIP_SECURITY: $SKIP_SECURITY
+    SKIP_DEPLOY: $SKIP_DEPLOY

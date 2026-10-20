@@ -1,0 +1,25 @@
+# =================================================================
+# CABEÇALHOS DE SEGURANÇA — fonte única, incluída em cada location
+# =================================================================
+# Renderizado no start do container: → /etc/nginx/conf.d/security-headers.inc
+# (extensão .inc de propósito: o nginx só inclui *.conf automaticamente).
+#
+# Origens do CSP por ambiente (env do Deployment; defaults no Dockerfile gerado):
+#   CSP_SCRIPT_SRC   default 'self'
+#   CSP_STYLE_SRC    default 'self' 'unsafe-inline'
+#   CSP_FONT_SRC     default 'self'
+#   CSP_IMG_SRC      default 'self' data:
+#   CSP_CONNECT_SRC  default 'self'   ← URL da API do ambiente entra aqui
+#   CSP_FRAME_SRC    default 'none'
+#
+# Angular com inlineCritical (padrão do build de produção) injeta um onload inline
+# que 'self' bloqueia: desligue em angular.json →
+#   "optimization": { "styles": { "inlineCritical": false } }
+# em vez de abrir 'unsafe-inline' no script-src.
+
+add_header X-Frame-Options "SAMEORIGIN" always;
+add_header X-Content-Type-Options "nosniff" always;
+add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
+add_header Permissions-Policy "geolocation=(), microphone=(), camera=()" always;
+add_header Content-Security-Policy "default-src 'self'; script-src ${CSP_SCRIPT_SRC}; style-src ${CSP_STYLE_SRC}; font-src ${CSP_FONT_SRC}; img-src ${CSP_IMG_SRC}; connect-src ${CSP_CONNECT_SRC}; frame-src ${CSP_FRAME_SRC}; frame-ancestors 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; report-uri /csp-report;" always;

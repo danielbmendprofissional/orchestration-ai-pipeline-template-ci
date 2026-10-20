@@ -1,0 +1,51 @@
+# ============================================================
+# =                TEMPLATE SEGURANÇA - OPENGREP (SAST)
+# ============================================================
+# Opengrep = fork aberto do Semgrep CE (sem a restrição de licença das regras).
+# Não existe imagem oficial — a imagem é construída pelo próprio template-ci
+# (tools/opengrep), com o binário e o pacote de regras em versões fixas.
+#
+# Variáveis:
+#   OPENGREP_RULESETS  pastas do pacote de regras (opengrep-rules) a aplicar
+#   .opengrep/         regras próprias do projeto — aplicadas junto, se existir
+.opengrep:
+  stage: security
+  image:
+    name: ${OPENGREP_IMAGE}
+    entrypoint: [""]
+  tags:
+    - $RUNNER_TAG
+  timeout: 20 minutes
+  interruptible: true
+  variables:
+    OPENGREP_IMAGE: registry.gitlab.com/orchestration-ai/ai-pipeline/template-ci/opengrep:v2.0.0
+    OPENGREP_RULESETS: "csharp typescript javascript html dockerfile generic"
+  script:
+    - |
+      set -eu
+      set --
+      for ruleset in $OPENGREP_RULESETS; do
+        if [ ! -d "/opt/opengrep-rules/$ruleset" ]; then
+          echo "[ERRO] Ruleset '$ruleset' não existe no pacote de regras da imagem"
+          exit 1
+        fi
+        set -- "$@" --config "/opt/opengrep-rules/$ruleset"
+      done
+      if [ -d .opengrep ]; then
+        echo "[INFO] Regras próprias do projeto: .opengrep/"
+        set -- "$@" --config .opengrep
+      fi
+
+      opengrep scan "$@" --json --output opengrep.json \
+        --exclude publish --exclude node_modules --exclude .nuget --exclude .npm . || true
+
+      if [ ! -f opengrep.json ]; then
+        echo "[ERRO] Opengrep não gerou opengrep.json"
+        exit 1
+      fi
+      echo "[INFO] opengrep.json gerado"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - opengrep.json

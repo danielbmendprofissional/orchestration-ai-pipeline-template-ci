@@ -1,0 +1,13 @@
+# Falsos positivos aceitos pelo security-gate — vai na raiz do projeto.
+# Uma regra por linha. Sempre com o motivo e quem aceitou: isto é uma decisão, não um atalho.
+#
+#   <ruleId>               ignora em qualquer ferramenta
+#   <ferramenta>:<ruleId>  só naquela (trivy casa trivy-fs e trivy-image)
+#
+# O ruleId é o que aparece no log do gate, entre a severidade e os dois-pontos.
+# No Opengrep ele vem com o caminho do pacote de regras:
+#   opt.opengrep-rules.csharp.lang.security.sqli.csharp-sqli
+#
+# Exemplos:
+# trivy:CVE-2024-12345          # sem correção upstream, não alcançável no nosso uso — Daniel, 2026-10
+# checkov:CKV_K8S_43            # imagem por digest já garantida pelo template

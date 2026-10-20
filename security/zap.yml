@@ -1,0 +1,60 @@
+# ============================================================
+# =               TEMPLATE SEGURANÇA - ZAP (DAST)
+# ============================================================
+# Baseline scan do OWASP ZAP contra o ambiente recém-publicado (spider + scan
+# passivo — não ataca ativamente). Só em qa/hml (rules), nunca em produção.
+#
+# Roda DEPOIS do deploy, então não impede aquele deploy: deixa a pipeline vermelha
+# (dast-gate), visível antes de alguém aprovar a próxima promoção.
+#
+# APP_URL: variável do GitLab com escopo de ambiente — URL pública do ambiente.
+.zap-baseline:
+  stage: verify
+  image:
+    name: zaproxy/zap-stable:2.17.0
+    entrypoint: [""]
+  tags:
+    - $RUNNER_TAG
+  timeout: 30 minutes
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - |
+      set -eu
+      if [ -z "${APP_URL:-}" ]; then
+        echo "[INFO] APP_URL não definida para o ambiente '$PIPELINE_ENV' — DAST pulado"
+        echo '{"site":[]}' > zap.json
+        exit 0
+      fi
+
+      mkdir -p /zap/wrk
+      # -I: alerta não derruba o job — quem decide é o dast-gate
+      zap-baseline.py -t "$APP_URL" -J zap.json -I || true
+      cp /zap/wrk/zap.json ./zap.json
+      echo "[INFO] zap.json gerado"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - zap.json
+
+.dast-gate:
+  extends: .security-gate-base
+  stage: verify
+  variables:
+    GIT_STRATEGY: fetch
+  script:
+    - |
+      set -eu
+      set -- --input . --output dast-report --export json,pdf \
+        --fail-on "$SECURITY_FAIL_ON" --target "${APP_URL:-sem APP_URL} ($PIPELINE_ENV)"
+      if [ -f "$SECURITY_IGNORE_FILE" ]; then
+        set -- "$@" --ignore-file "$SECURITY_IGNORE_FILE"
+      fi
+      security-scanner aggregate "$@"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    expose_as: "Relatorio DAST"
+    paths:
+      - dast-report/

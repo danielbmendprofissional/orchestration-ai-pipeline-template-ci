@@ -1,0 +1,35 @@
+# ============================================================
+# =                TEMPLATE SEGURANÇA - CHECKOV (IaC)
+# ============================================================
+# Misconfiguração de Dockerfile, manifests Kubernetes/Kustomize e workflows.
+# Sem API key da Prisma Cloud o Checkov não informa severidade: os achados
+# entram no relatório como UNKNOWN e não bloqueiam o gate — são informativos.
+.checkov:
+  stage: security
+  image:
+    name: bridgecrew/checkov:3.3.29
+    entrypoint: [""]
+  tags:
+    - $RUNNER_TAG
+  timeout: 20 minutes
+  interruptible: true
+  script:
+    - |
+      set -eu
+      checkov -d . --framework dockerfile kubernetes kustomize \
+        --skip-path publish --skip-path node_modules \
+        -o json --output-file-path checkov-out --soft-fail --quiet || true
+
+      if [ -f checkov-out/results_json.json ]; then
+        mv checkov-out/results_json.json checkov.json
+      else
+        # Nada a analisar (sem Dockerfile/manifests no repo) não é falha.
+        echo "[]" > checkov.json
+        echo "[INFO] Checkov não encontrou arquivos de IaC pra analisar"
+      fi
+      echo "[INFO] checkov.json gerado"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - checkov.json

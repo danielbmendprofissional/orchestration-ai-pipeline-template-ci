@@ -1,0 +1,102 @@
+# ============================================================
+# =                  TEMPLATE BUILD - .NET
+# ============================================================
+# Compila uma vez e publica cada app de DOTNET_APPS em publish/<nome>/ — esse
+# diretório vira artifact e é o que o job de imagem copia pra dentro do container.
+# Com EF_PROJECT definido, gera também o migration bundle (publish/migrator/efbundle)
+# e o script idempotente (publish/migrations.sql) pra revisão.
+#
+# Variáveis:
+#   DOTNET_SOLUTION      (obrigatória) .sln/.slnx usada no restore/build
+#   DOTNET_APPS          (obrigatória) "nome=caminho/Projeto.csproj", separados por espaço
+#   EF_PROJECT           (opcional)    projeto que contém as migrations
+#   EF_STARTUP_PROJECT   (com EF_PROJECT) projeto de startup do DbContext
+#   EF_CONTEXT           (opcional)    nome do DbContext, se houver mais de um
+#   DOTNET_SDK_IMAGE     (default)     mcr.microsoft.com/dotnet/sdk:10.0
+.build-dotnet:
+  stage: build
+  image: ${DOTNET_SDK_IMAGE}
+  tags:
+    - $RUNNER_TAG
+  timeout: 30 minutes
+  interruptible: true
+  variables:
+    DOTNET_SDK_IMAGE: mcr.microsoft.com/dotnet/sdk:10.0
+    DOTNET_CLI_TELEMETRY_OPTOUT: "1"
+    DOTNET_NOLOGO: "1"
+    NUGET_PACKAGES: $CI_PROJECT_DIR/.nuget/packages
+  cache:
+    key: nuget-packages
+    paths:
+      - .nuget/packages/
+  script:
+    - |
+      set -eu
+
+      echo "======================================"
+      echo "= RESTORE / BUILD"
+      echo "======================================"
+      echo "[INFO] DOTNET_SOLUTION : $DOTNET_SOLUTION"
+      echo "[INFO] DOTNET_APPS     : $DOTNET_APPS"
+
+      RESTORE_ARGS=""
+      if find . -name packages.lock.json -not -path './.nuget/*' | grep -q .; then
+        RESTORE_ARGS="--locked-mode"
+        echo "[INFO] packages.lock.json encontrado — restore em --locked-mode"
+      fi
+
+      # shellcheck disable=SC2086
+      dotnet restore "$DOTNET_SOLUTION" $RESTORE_ARGS
+      dotnet build "$DOTNET_SOLUTION" -c Release --no-restore
+
+      echo "======================================"
+      echo "= PUBLISH"
+      echo "======================================"
+      rm -rf publish
+      mkdir -p publish
+
+      for entry in $DOTNET_APPS; do
+        name="${entry%%=*}"
+        project="${entry#*=}"
+
+        if [ ! -f "$project" ]; then
+          echo "[ERRO] Projeto de '$name' não encontrado: $project"
+          exit 1
+        fi
+
+        echo "[INFO] Publicando '$name' ($project)"
+        dotnet publish "$project" -c Release --no-restore -o "publish/$name"
+
+        # O job de imagem precisa do nome real do assembly (AssemblyName pode
+        # diferir do nome do .csproj).
+        assembly=$(dotnet msbuild "$project" -getProperty:AssemblyName -p:Configuration=Release | tr -d '\r')
+        if [ ! -f "publish/$name/$assembly.dll" ]; then
+          echo "[ERRO] publish/$name/$assembly.dll não foi gerado — confira o AssemblyName de $project"
+          exit 1
+        fi
+        printf '%s' "$assembly" > "publish/$name/.assembly"
+      done
+
+      if [ -n "${EF_PROJECT:-}" ]; then
+        echo "======================================"
+        echo "= MIGRATIONS (EF CORE)"
+        echo "======================================"
+        dotnet tool install dotnet-ef --tool-path /tmp/dotnet-tools --version "10.*"
+        export PATH="$PATH:/tmp/dotnet-tools"
+
+        set -- --project "$EF_PROJECT" --startup-project "$EF_STARTUP_PROJECT" --configuration Release
+        if [ -n "${EF_CONTEXT:-}" ]; then
+          set -- "$@" --context "$EF_CONTEXT"
+        fi
+
+        mkdir -p publish/migrator
+        dotnet ef migrations bundle "$@" --self-contained -r linux-x64 -o publish/migrator/efbundle --force
+        dotnet ef migrations script "$@" --idempotent -o publish/migrations.sql
+
+        echo "[INFO] Bundle: publish/migrator/efbundle | script p/ revisão: publish/migrations.sql"
+      fi
+  artifacts:
+    name: "build-dotnet-$PIPELINE_TAG"
+    expire_in: 7 days
+    paths:
+      - publish/

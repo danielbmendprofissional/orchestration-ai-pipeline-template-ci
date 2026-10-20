@@ -1,0 +1,33 @@
+# ============================================================
+# =                TEMPLATE TEST - ANGULAR
+# ============================================================
+# TEST_COMMAND: script do package.json que roda os testes em modo CI (sem watch).
+# Relatório JUnit no GitLab quando o runner de teste gerar **/junit.xml.
+.test-angular:
+  stage: test
+  image: ${NODE_IMAGE}
+  tags:
+    - $RUNNER_TAG
+  timeout: 30 minutes
+  interruptible: true
+  variables:
+    NODE_IMAGE: node:24-alpine
+    NPM_CONFIG_CACHE: $CI_PROJECT_DIR/.npm
+  cache:
+    key: npm-cache
+    paths:
+      - .npm/
+    policy: pull
+  script:
+    - |
+      set -eu
+      cd "$CI_PROJECT_DIR${ANGULAR_WORKDIR:+/$ANGULAR_WORKDIR}"
+      npm ci --prefer-offline --no-audit --no-fund
+      echo "[INFO] Executando: npm run $TEST_COMMAND"
+      npm run "$TEST_COMMAND"
+  artifacts:
+    when: always
+    expire_in: 7 days
+    reports:
+      junit:
+        - "**/junit.xml"

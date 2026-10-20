@@ -1,0 +1,13 @@
+# Build do CLI
+bin/
+obj/
+
+# Saída do scan local (security-scanner scan) — ancorado na raiz:
+# um "targets/" solto casaria também com src/.../Targets/ no Windows.
+/targets/
+/results/
+
+# IDE
+.vs/
+.vscode/
+*.user

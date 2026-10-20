@@ -1,0 +1,30 @@
+# ============================================================
+# =              TEMPLATE SEGURANÇA - BETTERLEAKS (SECRETS)
+# ============================================================
+# Detecção de segredos no código (sucessor do Gitleaks, mesmo autor).
+# Escaneia o conteúdo do checkout — segredo encontrado é sempre HIGH no gate.
+.betterleaks:
+  stage: security
+  image:
+    name: ghcr.io/betterleaks/betterleaks:v1
+    entrypoint: [""]
+  tags:
+    - $RUNNER_TAG
+  timeout: 10 minutes
+  interruptible: true
+  script:
+    - |
+      set -eu
+      # sai com código != 0 quando encontra segredo — esperado, quem decide é o gate
+      betterleaks dir --report-format json --report-path betterleaks.json . || true
+
+      if [ ! -f betterleaks.json ]; then
+        echo "[ERRO] BetterLeaks não gerou betterleaks.json"
+        exit 1
+      fi
+      echo "[INFO] betterleaks.json gerado"
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - betterleaks.json

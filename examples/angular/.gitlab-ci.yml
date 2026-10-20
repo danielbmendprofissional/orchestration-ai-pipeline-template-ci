@@ -1,0 +1,22 @@
+# Exemplo: front Angular servido por nginx (nginx-unprivileged) no Kubernetes.
+# Estrutura esperada no repositório:
+#   package.json / package-lock.json / angular.json
+#   nginx/app.conf.template + nginx/security-headers.inc.template  (copiar de examples/angular/nginx)
+#   deploy/k8s/base + deploy/k8s/overlays/<dev|qa|hml|production>
+include:
+  - project: orchestration-ai/ai-pipeline/template-ci
+    file: /ci-template.yml
+    ref: v2.0.0
+
+variables:
+  APP_TECHNOLOGY: angular
+  ANGULAR_DIST_PATH: dist/meu-front/browser
+  ANGULAR_APP_NAME: web
+  BUILD_COMMAND: build
+  TEST_COMMAND: test:ci          # script sem watch; vazio = sem job de teste
+  HEALTH_PATH: /healthz
+
+# Variáveis por ambiente (GitLab → Settings → CI/CD → Variables, com Environment scope):
+#   KUBE_CONTEXT   meu-grupo/meu-projeto:qa   (vazio no dev = sem deploy)
+#   K8S_NAMESPACE  meu-projeto
+#   APP_URL        https://qa.meu-projeto.dev
