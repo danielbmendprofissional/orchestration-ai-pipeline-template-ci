@@ -1,0 +1,84 @@
+# ============================================================
+# =              TEMPLATE REVIEW - FECHAR A FATIA NO MERGE
+# ============================================================
+# Opt-in (FECHAR_FATIA_ENABLED: "true"), só em push na dev (= o merge de uma MR de fatia).
+# Nenhuma IA roda aqui. O job:
+#   1. acha as MRs mergeadas que contêm o commit do push e delas tira o código da fatia
+#      (branch feature/b2-<slug> ou título "B2 — …");
+#   2. confere, em cada repositório de SLICE_REPOS, se sobrou MR aberta da fatia pra dev — sobrou,
+#      espera o merge dela (esse job roda de novo no push seguinte);
+#   3. todas mergeadas: nota na issue-mãe com os links, fecha as filhas e a mãe, tira o label
+#      em-execucao. A linha do specs/README.md ele não toca (é commit no workspace).
+# A rede de segurança continua no /implement-task, /to-spec e /fatia ("Fechar a fatia").
+#
+#   FECHAR_FATIA_ENABLED  "true" liga o job (default "false")
+#   WORKSPACE_PROJECT     caminho do projeto das issues, ex: orchestration-ai/esteira/esteira-workspace
+#   SLICE_REPOS           caminhos dos repositórios de código do projeto, separados por espaço
+#   GITLAB_TOKEN          token mascarado com escopo api e acesso a TODOS esses projetos (inclusive o
+#                         workspace) — group access token (Developer). O token de projeto do gate de
+#                         review só enxerga o próprio repositório e não serve aqui.
+.fechar-fatia:
+  stage: review
+  image: node:22-alpine
+  tags:
+    - $RUNNER_TAG
+  timeout: 5 minutes
+  allow_failure: true
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - |
+      node --input-type=module <<'JS'
+      const env = process.env;
+      const faltam = ['GITLAB_TOKEN', 'WORKSPACE_PROJECT', 'SLICE_REPOS', 'CI_PROJECT_ID', 'CI_COMMIT_SHA', 'CI_API_V4_URL']
+        .filter((k) => !env[k]);
+      if (faltam.length) { console.error(`[ERRO] variáveis ausentes: ${faltam.join(', ')}`); process.exit(1); }
+
+      const enc = encodeURIComponent;
+      const call = async (method, path, body) => {
+        const r = await fetch(`${env.CI_API_V4_URL}${path}`, {
+          method,
+          headers: { 'PRIVATE-TOKEN': env.GITLAB_TOKEN, ...(body ? { 'Content-Type': 'application/json' } : {}) },
+          body: body ? JSON.stringify(body) : undefined,
+        });
+        if (!r.ok) throw new Error(`${method} ${path} -> ${r.status} ${await r.text()}`);
+        return r.status === 204 ? null : r.json();
+      };
+
+      // código da fatia: letras+número, com sufixo opcional de uma letra (B2, E1a). Canônico: B2, E1a.
+      const canon = (c) => { const m = c.match(/^([A-Za-z]+\d+)([A-Za-z]?)$/); return m ? m[1].toUpperCase() + m[2].toLowerCase() : c; };
+      const codeOf = (mr) =>
+        canon(mr.source_branch.match(/^feature\/([a-z]+\d+[a-z]?)-/)?.[1] ?? mr.title.match(/^([A-Z]+\d+[a-z]?) — /)?.[1] ?? '');
+
+      const doPush = await call('GET', `/projects/${env.CI_PROJECT_ID}/repository/commits/${env.CI_COMMIT_SHA}/merge_requests`);
+      const codes = [...new Set(doPush.filter((m) => m.target_branch === 'dev' && m.state === 'merged').map(codeOf).filter(Boolean))];
+      if (!codes.length) { console.log('[INFO] push em dev sem MR de fatia — nada a fechar'); process.exit(0); }
+
+      const W = enc(env.WORKSPACE_PROJECT);
+      for (const code of codes) {
+        const low = code.toLowerCase();
+        const dela = (m) => m.source_branch.startsWith(`feature/${low}-`) || m.title.startsWith(`${code} — `);
+        let abertas = 0;
+        const mergeadas = [];
+        for (const repo of env.SLICE_REPOS.split(/\s+/).filter(Boolean)) {
+          for (const state of ['opened', 'merged']) {
+            const lista = await call('GET', `/projects/${enc(repo)}/merge_requests?target_branch=dev&state=${state}&per_page=100`);
+            for (const m of lista.filter(dela)) (state === 'opened' ? abertas++ : mergeadas.push(m.web_url));
+          }
+        }
+        if (abertas) { console.log(`[INFO] ${code}: ${abertas} MR(s) ainda abertas — espera o merge delas`); continue; }
+
+        const achar = async (tipo) => call('GET', `/projects/${W}/issues?state=opened&issue_type=${tipo}&search=${enc(code)}&in=title&per_page=100`);
+        const todas = [...(await achar('issue')), ...(await achar('task'))];
+        const mae = todas.find((i) => i.title.startsWith(`${code} — `));
+        const filhas = todas.filter((i) => new RegExp(`^${code}\\.\\d+ — `).test(i.title));
+        if (!mae) { console.log(`[INFO] ${code}: issue-mãe aberta não encontrada em ${env.WORKSPACE_PROJECT} — nada a fechar`); continue; }
+
+        await call('POST', `/projects/${W}/issues/${mae.iid}/notes`, {
+          body: `Fatia **${code}** mergeada em \`dev\`: ${mergeadas.join(' · ')}. Fechada pelo CI (${env.CI_PIPELINE_URL ?? 'pipeline'}).`,
+        });
+        for (const f of filhas) await call('PUT', `/projects/${W}/issues/${f.iid}`, { state_event: 'close' });
+        await call('PUT', `/projects/${W}/issues/${mae.iid}`, { state_event: 'close', remove_labels: 'em-execucao' });
+        console.log(`[INFO] ${code}: mãe #${mae.iid} e ${filhas.length} filha(s) fechadas`);
+      }
+      JS

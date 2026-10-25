@@ -20,6 +20,12 @@
       when: on_success
     - when: never
 
+.rules-fechar-fatia:
+  rules:
+    - if: '$CI_COMMIT_BRANCH == "dev" && $FECHAR_FATIA_ENABLED == "true"'
+      when: on_success
+    - when: never
+
 .rules-review:
   rules:
     - if: '$CI_COMMIT_BRANCH =~ /^feature\// && $REVIEW_GATE_ENABLED == "true"'

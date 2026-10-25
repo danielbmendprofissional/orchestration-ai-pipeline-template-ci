@@ -4,9 +4,11 @@
 # Opt-in (REVIEW_GATE_ENABLED: "true"), só em push de feature/*.
 # Nenhuma IA roda aqui — só confere a prova deixada pelo /code-review local:
 #
-#   .pi/code-review-ok.json  {"commit": "<sha revisado>", ...}
+#   .code-review-ok.json  {"commit": "<sha revisado>", ...}   (raiz do repositório)
 #
-# O sha precisa ser o do próprio push. Bateu: abre a MR pra dev automaticamente.
+# A prova é comitada depois da revisão, então o sha gravado é o do commit revisado
+# e o push é o commit da prova logo acima dele. Aceita: sha == push, ou sha == pai do
+# push e o push mexe só no .code-review-ok.json. Bateu: abre a MR pra dev.
 # Não bateu ou não existe: pipeline vermelha, nenhuma MR — rode /code-review de novo.
 #
 # Abrir MR exige GITLAB_TOKEN (project access token, escopo api, role Developer)
@@ -17,22 +19,31 @@
   tags:
     - $RUNNER_TAG
   timeout: 5 minutes
+  variables:
+    GIT_DEPTH: "2"
   script:
     - |
       set -eu
-      PROOF=.pi/code-review-ok.json
+      PROOF=.code-review-ok.json
       if [ ! -f "$PROOF" ]; then
         echo "[ERRO] $PROOF não encontrado. Rode /code-review antes do push."
         exit 1
       fi
 
-      apk add --no-cache jq >/dev/null
+      apk add --no-cache jq git >/dev/null
       REVIEWED_SHA=$(jq -r '.commit // empty' "$PROOF")
-      if [ "$REVIEWED_SHA" != "$CI_COMMIT_SHA" ]; then
-        echo "[ERRO] $PROOF é do commit '${REVIEWED_SHA:-<vazio>}', o push é $CI_COMMIT_SHA. Rode /code-review de novo."
-        exit 1
+      if [ "$REVIEWED_SHA" = "$CI_COMMIT_SHA" ]; then
+        echo "[INFO] Code review OK para $CI_COMMIT_SHA"
+        exit 0
       fi
-      echo "[INFO] Code review OK para $CI_COMMIT_SHA"
+      PARENT_SHA=$(git rev-parse HEAD^ 2>/dev/null || true)
+      CHANGED=$(git diff --name-only HEAD^ HEAD 2>/dev/null || true)
+      if [ -n "$PARENT_SHA" ] && [ "$REVIEWED_SHA" = "$PARENT_SHA" ] && [ "$CHANGED" = "$PROOF" ]; then
+        echo "[INFO] Code review OK para $PARENT_SHA (prova comitada em $CI_COMMIT_SHA)"
+        exit 0
+      fi
+      echo "[ERRO] $PROOF é do commit '${REVIEWED_SHA:-<vazio>}', o push é $CI_COMMIT_SHA (pai ${PARENT_SHA:-?}, mudou: ${CHANGED:-?}). Rode /code-review de novo."
+      exit 1
 
 .abrir-mr-dev:
   stage: review

@@ -44,7 +44,7 @@ Padrão do orchestration-ai (mesmo desenho do próprio `orquestracao-ai`): um **
 
 ```
 GitLab: grupo valuto/                   Local: valuto/        ← clone do valuto-workspace
-  ├── valuto-workspace  regras + issues          ├── CLAUDE.md, .claude/, .pi/, docs/, CONTEXT-MAP.md
+  ├── valuto-workspace  regras + issues          ├── CLAUDE.md, .claude/, docs/, CONTEXT-MAP.md
   ├── valuto-api        APP_TECHNOLOGY: dotnet   ├── valuto-api/       (.git próprio)
   └── valuto-frontend   APP_TECHNOLOGY: angular  └── valuto-frontend/  (.git próprio)
 ```
@@ -150,7 +150,11 @@ dotnet run --project tools/security-scanner/src/SecurityScanner.Cli -- scan --ta
 
 ## Gate de code review (opt-in)
 
-Com `REVIEW_GATE_ENABLED: "true"` no projeto, push em `feature/*` roda só o stage `review`: `verify-code-review` exige `.pi/code-review-ok.json` com `"commit"` igual ao sha do push (prova do `/code-review` local — nenhuma IA roda no CI) e, se bater, `abrir-mr-dev` abre a MR `feature/* → dev`. Precisa de `GITLAB_TOKEN` (project access token, escopo `api`, mascarado) — o `CI_JOB_TOKEN` não cria MR.
+Com `REVIEW_GATE_ENABLED: "true"` no projeto, push em `feature/*` roda só o stage `review`: `verify-code-review` exige `.code-review-ok.json` na raiz com `"commit"` igual ao sha do push, ou ao pai dele quando o push só adiciona a prova (prova do `/code-review` local — nenhuma IA roda no CI) e, se bater, `abrir-mr-dev` abre a MR `feature/* → dev`. Precisa de `GITLAB_TOKEN` (project access token, escopo `api`, mascarado) — o `CI_JOB_TOKEN` não cria MR.
+
+## Fechar a fatia no merge (opt-in)
+
+Com `FECHAR_FATIA_ENABLED: "true"`, o push na `dev` (o merge de uma MR) roda só o job `fechar-fatia` (`review/fechar-fatia.yml`, nenhuma IA): acha o código da fatia na MR mergeada (branch `feature/b2-…` ou título `B2 — …`), espera todas as MRs da fatia nos repositórios de `SLICE_REPOS` estarem mergeadas e então comenta na issue-mãe, fecha as filhas e a mãe e tira o label `em-execucao`. Variáveis do projeto: `WORKSPACE_PROJECT` (caminho do projeto das issues) e `SLICE_REPOS` (repositórios de código, separados por espaço). O `GITLAB_TOKEN` precisa enxergar **todos** esses projetos — use um *group access token* (escopo `api`, Developer) mascarado no grupo; o token de projeto do gate de review não basta. O job é `allow_failure`: se falhar, o `/implement-task` seguinte fecha a fatia ("Fechar a fatia" em `docs/agents/orchestration.md` do ai-base).
 
 ## Setup único
 
@@ -172,7 +176,7 @@ Com `REVIEW_GATE_ENABLED: "true"` no projeto, push em `feature/*` roda só o sta
 ```
 ci-template.yml / ci-execucao.yml   pai e filho
 common/        controlar-pipeline (fluxo de tag + definir-kind), rules
-review/        gate de code review em feature/* (opt-in)
+review/        gate de code review em feature/* e fechamento da fatia no merge em dev (opt-in)
 build/ test/   .NET e Angular
 image/         build/retag/resolve no registry
 security/      trivy, opengrep, checkov, betterleaks, gate, zap
